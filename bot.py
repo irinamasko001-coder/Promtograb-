@@ -525,14 +525,26 @@ def extract_kie_text(data: Any) -> str:
     return data.get("output_text") or data.get("text") or json.dumps(data, ensure_ascii=False)
 
 
-async def kie_request(url: str, payload: dict[str, Any]) -> str:
+async def kie_request(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    attempts: int = 3,
+    timeout_seconds: float = 600.0,
+) -> str:
     headers = {"Authorization": f"Bearer {S.kie_key}", "Content-Type": "application/json"}
     last_error: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0)) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout_seconds, connect=30.0)
+            ) as client:
                 response = await client.post(url, headers=headers, json=payload)
-                response.raise_for_status()
+                if response.is_error:
+                    detail = response.text.strip()[:1000]
+                    raise RuntimeError(
+                        f"Kie API HTTP {response.status_code}: {detail or response.reason_phrase}"
+                    )
                 ctype = response.headers.get("content-type", "")
                 if "text/event-stream" in ctype:
                     final: dict[str, Any] | None = None
@@ -551,9 +563,9 @@ async def kie_request(url: str, payload: dict[str, Any]) -> str:
                                 deltas.append(delta)
                     return extract_kie_text(final) if final else "".join(deltas)
                 return extract_kie_text(response.json())
-        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
             last_error = exc
-            if attempt < 2:
+            if attempt < attempts - 1:
                 await asyncio.sleep(2 ** attempt)
     raise RuntimeError(f"Kie API error: {last_error}")
 
@@ -675,7 +687,37 @@ async def terra_text(instruction: str, content: str, effort: str = "medium") -> 
         "max_output_tokens": 22000,
         "stream": False,
     }
-    return await kie_request("https://api.kie.ai/codex/v1/responses", payload)
+    try:
+        # The Codex-compatible Kie endpoint can occasionally keep an SSE
+        # connection open indefinitely. Cap the whole request and then use the
+        # already configured Gemini endpoint as a text-only fallback.
+        return await asyncio.wait_for(
+            kie_request(
+                "https://api.kie.ai/codex/v1/responses",
+                payload,
+                attempts=1,
+                timeout_seconds=240.0,
+            ),
+            timeout=300.0,
+        )
+    except (asyncio.TimeoutError, RuntimeError, httpx.HTTPError):
+        fallback_payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": instruction + "\n\n" + content,
+                }
+            ],
+            "stream": False,
+            "include_thoughts": False,
+            "reasoning_effort": effort,
+        }
+        return await kie_request(
+            "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
+            fallback_payload,
+            attempts=2,
+            timeout_seconds=300.0,
+        )
 
 
 async def create_scenario(meta: dict[str, Any], transcript: str, visual: str) -> str:
