@@ -721,8 +721,36 @@ async def analyze_video(
             visual_payload(content), attempts=3, timeout_seconds=300.0,
         )
         lowered = result.lower()
-        if any(marker in lowered for marker in ('"code": 524', '"code":524', "http 400", "interal error")):
-            raise RuntimeError("Прямой анализ видео вернул внутреннюю ошибку")
+        error_markers = (
+            '"code": 524', '"code":524', "http 400", "interal error",
+        )
+        # Gemini sometimes answers with a normal HTTP 200 but plain text saying
+        # it couldn't actually see/reach the video (wrong content-type, slow
+        # Railway response, oversized file, etc). That text doesn't match the
+        # technical error markers above, so it used to be accepted as a valid
+        # (but empty) analysis. Catch those phrasings explicitly.
+        no_video_markers = (
+            "не вижу", "не видно", "не удалось получить доступ", "не могу получить доступ",
+            "не могу просмотреть", "не могу открыть", "не могу воспроизвести",
+            "не найдено видео", "видео не найдено", "нет прикреплённого видео",
+            "нет прикрепленного видео", "не был предоставлен", "не была предоставлена",
+            "отсутствует видео", "нет видео", "не содержит видео", "недоступн",
+            "cannot access", "can't access", "unable to access", "unable to view",
+            "unable to load", "i don't see", "i do not see", "i cannot see",
+            "no video", "no image or video", "video could not be", "failed to load",
+            "unable to retrieve", "unable to fetch", "i don't have access",
+            "i do not have access",
+        )
+        looks_empty = any(marker in lowered for marker in error_markers)
+        looks_blind = any(marker in lowered for marker in no_video_markers)
+        # A genuine per-shot breakdown for a real video is long. A refusal or
+        # "I can't see it" reply is almost always short — use that as a second
+        # signal so phrasings not covered by the lists above are still caught.
+        looks_too_short = len(result.strip()) < 400
+        if looks_empty or looks_blind or looks_too_short:
+            raise RuntimeError(
+                "Прямой анализ видео по ссылке не удался (пустой/короткий/отрицающий ответ модели)"
+            )
         return result, []
     except RuntimeError:
         frames = await extract_analysis_frames(video, target_dir / "analysis-frames", duration)
@@ -1332,9 +1360,26 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "telegram-video-script-bot"}
 
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def guess_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return "image/jpeg" if suffix in {".jpg", ".jpeg"} else f"image/{suffix.lstrip('.')}"
+    if suffix in VIDEO_EXTENSIONS:
+        return "video/mp4" if suffix == ".mp4" else f"video/{suffix.lstrip('.')}"
+    # Files downloaded via gdown (Google Drive) can end up without any
+    # extension at all (see download_url_sync). Default to video/mp4 there —
+    # everything this bot serves without a recognized suffix is source video,
+    # never an arbitrary unknown type. Without an explicit content-type the
+    # remote analysis service can fail to recognize the payload as a video.
+    return "video/mp4"
+
+
 @app.get("/media/{token}")
 async def serve_media(token: str) -> FileResponse:
     path = MEDIA_FILES.get(token)
     if not path or not path.exists():
         raise HTTPException(status_code=404, detail="Media expired")
-    return FileResponse(path)
+    return FileResponse(path, media_type=guess_media_type(path))
