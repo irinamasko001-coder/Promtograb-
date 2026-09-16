@@ -425,7 +425,8 @@ async def extract_analysis_frames(video: Path, target_dir: Path, duration: float
         output = target_dir / f"frame-{index:04d}.jpg"
         await run_command(
             "ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(video),
-            "-frames:v", "1", "-vf", "scale='min(768,iw)':-2", "-q:v", "3", str(output)
+            "-frames:v", "1", "-vf", "scale='min(768,iw)':-2",
+            "-pix_fmt", "yuvj420p", "-threads", "1", "-q:v", "3", str(output)
         )
         if output.exists() and output.stat().st_size:
             frames.append((timestamp, output))
@@ -653,7 +654,8 @@ async def moderation_frames(video: Path, duration: float, target_dir: Path) -> l
         output = target_dir / f"mod-{index:02d}.jpg"
         await run_command(
             "ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(video),
-            "-frames:v", "1", "-vf", "scale='min(512,iw)':-2", "-q:v", "5", str(output),
+            "-frames:v", "1", "-vf", "scale='min(512,iw)':-2",
+            "-pix_fmt", "yuvj420p", "-threads", "1", "-q:v", "5", str(output),
         )
         if output.exists() and output.stat().st_size:
             frames.append(output)
@@ -1256,7 +1258,10 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
 
             if S.moderation_enabled:
                 await status("2/5 — Проверяю содержание видео…")
-                mod_frames = await moderation_frames(video, duration, job_dir / "moderation-frames")
+                try:
+                    mod_frames = await moderation_frames(video, duration, job_dir / "moderation-frames")
+                except Exception:
+                    mod_frames = []
                 if await check_moderation(mod_frames):
                     await status(
                         "Это видео нельзя обработать: обнаружен откровенный сексуальный контент. "
