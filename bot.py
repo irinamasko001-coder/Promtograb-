@@ -964,29 +964,81 @@ async def create_scenario(meta: dict[str, Any], transcript: str, visual: str) ->
 
 
 SEEDANCE_SYSTEM = """Преобразуй точный реконструированный сценарий в готовые промпты Seedance 2.0.
-Не добавляй ничего, чего нет в сценарии. Не пиши отрицательные действия вроде «не замирает»;
-описывай только фактическое положительное действие. Сохраняй точные реплики, планы, склейки,
-эмоции, жесты, направления взглядов и отдельные появления VFX.
+Пиши только на русском языке — английской версии не давай вообще, даже частично.
 
-Каждая генерация максимум 15 секунд. Длинный ролик раздели по монтажным склейкам или сменам
-говорящего. Каждая часть должна быть самостоятельной и содержать:
-1. В самом начале одной строкой — на что ссылаются @image1, @image2 и т.д. (кто/что на
-   референсе), без отдельного развёрнутого раздела под это.
-2. Только действительно необходимые критические ограничения (1–3 пункта, не более).
-3. Фотореалистичное кинематографическое качество; не мультфильм, не пластик.
-4. Вертикальный формат 9:16 и точное число шотов.
-5. Каждый Shot с таймкодом, крупностью, камерой, положением LEFT/RIGHT/center, фоном,
-   последовательным действием, эмоцией и дословной репликой — сама раскадровка по шотам
-   и есть детализация плана, отдельную таблицу раскадровки строить не нужно.
-6. Audio: голоса для lip-sync, все реплики и звуки по порядку, музыка только если есть.
-7. Освещение.
-8. Финальная строка: X seconds. Vertical 9:16. 720p. 24fps.
+ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: пиши максимально просто и прямо, как инструкцию для нейросети-генератора,
+а не как киноведческий разбор. Короткие прямые предложения. Никакого профессионального
+киножаргона («мизансцена», «полиэкранная композиция», «внутрикадровый монтаж» и подобное) —
+если нужно описать план из нескольких элементов, просто перечисли, что где находится, обычными
+словами. Не усложняй описание движений: вместо длинных цепочек «сгибает, разгибает, ритмично
+двигает в такт» пиши коротко и естественно, например «бежит с реалистичной физикой движений» —
+детали физики нужны только там, где без них план непонятен. Не пиши двусмысленные фразы,
+которые нейросеть может понять наоборот (например «лицо скрыто дистанцией» может быть прочитано
+как указание что-то скрыть) — пиши прямо, что́ видно, а не что не видно.
 
-Пиши ТОЛЬКО на русском языке — не давай английскую версию вообще, даже частично.
-Не создавай отдельный раздел со списком референсов и не создавай таблицу раскадровки —
-вся нужная детализация уже находится внутри самих Shot по порядку. Не пиши вступления и
-заключения — начинай сразу с первой части и заканчивай последней строкой последнего шота.
-Каждую самостоятельную часть оформляй отдельным блоком в тройных обратных кавычках."""
+Не добавляй ничего, чего нет в сценарии. Сохраняй точные реплики, эмоции, ключевые жесты,
+направления взглядов и отдельные появления VFX — но формулируй компактно и без повторов.
+
+ССЫЛКИ НА РЕФЕРЕНСЫ (@image1, @image2…)
+Референсом обозначай только то, что реально можно сфотографировать и прикрепить отдельным
+файлом: внешность каждого персонажа (один референс на персонажа) и отдельный характерный
+предмет/реквизит крупным планом (оружие, бутылка, конкретный аксессуар). НЕ создавай отдельный
+@image для локации, фона или общей атмосферы сцены — место действия и окружение просто описывай
+текстом внутри плана, без номера референса. В самом начале одной строкой перечисли все
+использованные референсы: «@image1 — кто/что», «@image2 — кто/что» и т.д., коротко.
+
+ВРЕМЯ
+Округляй все таймкоды до целых секунд (0–2s, 2–5s, 5–9s и т.д.), не пиши доли секунды и
+миллисекунды.
+
+КРИТИЧЕСКИЕ ОГРАНИЧЕНИЯ — ТОЛЬКО КОГДА РЕАЛЬНО НУЖНЫ
+Не добавляй этот блок «на всякий случай». Пиши его только если в кадре одновременно несколько
+персонажей (тогда одной строкой: «В кадре ровно N человек: [список]. Без дублей») или если есть
+специфический технический риск (например, резкая смена стиля кадра посреди плана). Если такого
+риска нет — просто не создавай этот блок вообще.
+
+СТРУКТУРА КАЖДОЙ ЧАСТИ (максимум 15 секунд; длинный ролик дели по склейкам/смене говорящего).
+Не пиши сплошным текстом — каждый параметр с новой строки, с жирной подписью, коротко:
+
+**Референсы:** @image1 — …, @image2 — …
+**Стиль:** фотореалистичное кинематографическое качество, не мультфильм, не пластик.
+**Формат:** вертикальный 9:16, N шотов.
+
+**Shot 1 (0–Ns)**
+**Крупность:** (простыми словами: крупный план лица / по пояс / в полный рост)
+**Камера:** где стоит и как снимает, простыми словами
+**Положение:** кто где — LEFT / RIGHT / center
+**Фон:** одной фразой, что видно позади (обязательно, если герой один в кадре)
+**Действие:** что происходит, по порядку, простыми предложениями
+**Эмоция:** что видно на лице — глаза, брови, губы (без одного слова вроде «грустная»)
+**Реплика:** тон голоса коротко + сама реплика в кавычках
+**VFX:** только если реально есть эффект
+
+Если персонаж обращается к кому-то за кадром — одной строкой укажи, где этот кто-то за кадром
+(LEFT/RIGHT) и куда смотрит говорящий; если адресат — зритель, пиши, что взгляд направлен в
+камеру. Фон не переописывай заново, если он не поменялся с предыдущего Shot — пиши «тот же фон».
+Внешность персонажа заново не пересказывай — она уже дана в референсах, в Shot ссылайся на
+@imageN.
+
+**Audio:** тип голоса + реплики по порядку + окружающие звуки; «без музыки», если музыки нет.
+**Свет:** одна-две фразы.
+
+Финальная строка: X seconds. Vertical 9:16. 720p. 24fps.
+
+СЛОВ-ТРИГГЕРОВ ИЗБЕГАЙ (могут заблокировать генерацию):
+— слова «юная/подросток/несовершеннолетн*» в описании внешности;
+— «текстура кожи», «поры»;
+— анатомические термины вроде «грудь» — опиши силуэт или одежду вместо этого;
+— «светящиеся/сверкающие глаза» — вместо этого «яркие глаза», «широко раскрытые глаза»;
+— КАПСЛОК в описании эмоций — обычный регистр;
+— подряд несколько слов про злость/издёвку/травлю — разбавляй нейтральной лексикой;
+— студийные имена и узнаваемые визуальные атрибуты персонажей известных франшиз — называй
+  персонажа по роли («бог подземного царства», «девушка в сиреневом платье»), а не собственным
+  именем конкретной франшизы.
+
+Не пиши вступления и заключения — начинай сразу с первой части и заканчивай последней строкой
+последнего шота. Каждую самостоятельную часть оформляй отдельным блоком в тройных обратных
+кавычках."""
 
 
 async def create_seedance(scenario: str) -> str:
@@ -999,6 +1051,15 @@ async def revise_scenario(scenario: str, correction: str) -> str:
         "а не отдельный фрагмент. Сохрани все остальные утверждённые детали."
     )
     content = f"ПРАВКА ПОЛЬЗОВАТЕЛЯ:\n{correction}\n\nТЕКУЩИЙ СЦЕНАРИЙ:\n{scenario}"
+    return (await terra_text(instruction, content, "high")).strip()
+
+
+async def revise_seedance(prompt: str, correction: str) -> str:
+    instruction = SEEDANCE_SYSTEM + (
+        "\n\nПравка пользователя имеет высший приоритет. Верни полный исправленный промпт целиком, "
+        "а не отдельный фрагмент. Сохрани все остальные утверждённые детали, которые правка не касается."
+    )
+    content = f"ПРАВКА ПОЛЬЗОВАТЕЛЯ:\n{correction}\n\nТЕКУЩИЙ ПРОМПТ:\n{prompt}"
     return (await terra_text(instruction, content, "high")).strip()
 
 
@@ -1030,6 +1091,19 @@ def scenario_keyboard(job_id: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Создать промпты Seedance", callback_data=f"seedance:{job_id}")]
         ]
     )
+
+
+def seedance_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Исправить промпт", callback_data=f"revise_prompt:{job_id}")]
+        ]
+    )
+
+
+# user_id -> job_id: set when someone taps "✏️ Исправить промпт" and cleared once
+# their next plain-text message is consumed as the correction (see `fallback`).
+PENDING_PROMPT_REVISIONS: dict[int, str] = {}
 
 
 async def ensure_known(message: Message) -> bool:
@@ -1282,7 +1356,10 @@ async def callback_seedance(callback: CallbackQuery) -> None:
         await status.edit_text("Готово.")
         for chunk in chunks_with_intro("Промпт Seedance 2.0 (файл приложен):", result):
             await callback.message.answer(chunk)
-        await callback.message.answer_document(FSInputFile(path, filename=f"seedance-{job_id[:8]}.md"))
+        await callback.message.answer_document(
+            FSInputFile(path, filename=f"seedance-{job_id[:8]}.md"),
+            reply_markup=seedance_keyboard(job_id),
+        )
     except Exception as exc:
         await status.edit_text("Не удалось создать промпт. Попробуйте позже.\n" + str(exc)[-500:])
 
@@ -1384,6 +1461,7 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
                 chat_id,
                 FSInputFile(seedance_path, filename=f"seedance-{job_id[:8]}.md"),
                 caption="Промпт Seedance 2.0.",
+                reply_markup=seedance_keyboard(job_id),
             )
         except Exception as exc:
             if charged:
@@ -1456,10 +1534,58 @@ async def receive_url(message: Message) -> None:
     asyncio.create_task(process_job(job_id, message.from_user.id, message.chat.id, url, None, status.message_id))
 
 
+@ROUTER.callback_query(F.data.startswith("revise_prompt:"))
+async def callback_revise_prompt(callback: CallbackQuery) -> None:
+    if not callback.data or not callback.message or not callback.from_user:
+        return
+    job_id = callback.data.split(":", 1)[1]
+    job = await DB.get_job(job_id, callback.from_user.id)
+    if not job or not job.get("scenario_path"):
+        await callback.answer("Промпт не найден", show_alert=True)
+        return
+    path = Path(job["scenario_path"]).with_name("seedance-prompts.md")
+    if not path.exists():
+        await callback.answer("Файл промпта не найден", show_alert=True)
+        return
+    PENDING_PROMPT_REVISIONS[callback.from_user.id] = job_id
+    await callback.answer()
+    await callback.message.answer("Напишите одним сообщением, что нужно исправить в промпте.")
+
+
 @ROUTER.message()
 async def fallback(message: Message) -> None:
-    if await ensure_known(message):
-        await message.answer("Пришлите видеофайл или одну публичную ссылку на видео.")
+    if not await ensure_known(message) or not message.from_user:
+        return
+    job_id = PENDING_PROMPT_REVISIONS.pop(message.from_user.id, None)
+    if job_id:
+        correction = (message.text or "").strip()
+        if not correction:
+            PENDING_PROMPT_REVISIONS[message.from_user.id] = job_id
+            await message.answer("Пришлите правку текстом одним сообщением.")
+            return
+        job = await DB.get_job(job_id, message.from_user.id)
+        if not job or not job.get("scenario_path"):
+            await message.answer("Промпт не найден.")
+            return
+        path = Path(job["scenario_path"]).with_name("seedance-prompts.md")
+        if not path.exists():
+            await message.answer("Файл промпта не найден.")
+            return
+        status = await message.answer("Переписываю промпт с учётом правки…")
+        try:
+            updated = await revise_seedance(path.read_text(encoding="utf-8"), correction)
+            path.write_text(updated, encoding="utf-8")
+            await status.edit_text("Готово.")
+            for chunk in chunks_with_intro("Исправленный промпт (файл приложен):", updated):
+                await message.answer(chunk)
+            await message.answer_document(
+                FSInputFile(path, filename=f"seedance-{job_id[:8]}.md"),
+                reply_markup=seedance_keyboard(job_id),
+            )
+        except Exception as exc:
+            await status.edit_text("Не удалось применить правку. Попробуйте ещё раз.\n" + str(exc)[-500:])
+        return
+    await message.answer("Пришлите видеофайл или одну публичную ссылку на видео.")
 
 
 POLLING_TASK: asyncio.Task[Any] | None = None
