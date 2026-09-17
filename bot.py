@@ -22,6 +22,7 @@ import gdown
 import httpx
 import yt_dlp
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
@@ -129,6 +130,20 @@ def split_text(text: str, limit: int = 3800) -> list[str]:
         result.append(rest[:cut].strip())
         rest = rest[cut:].strip()
     return result
+
+
+def chunks_with_intro(intro: str, text: str, limit: int = 3800) -> list[str]:
+    """split_text, but fold a short intro line into the first chunk instead of
+    sending it as its own message — keeps the reply count to a minimum."""
+    chunks = split_text(text, limit)
+    if not chunks:
+        return [intro]
+    combined = intro + "\n\n" + chunks[0]
+    if len(combined) <= limit:
+        chunks[0] = combined
+    else:
+        chunks.insert(0, intro)
+    return chunks
 
 
 def safe_name(value: str) -> str:
@@ -738,12 +753,37 @@ async def analyze_frame_batches(
                 "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
                 visual_payload(content), attempts=3, timeout_seconds=300.0,
             )
+            if is_refusal(report):
+                raise RuntimeError(
+                    "Модель отказалась анализировать видео из-за политики безопасности "
+                    "(возможно, в кадре что-то похожее на оружие, насилие или другой "
+                    "чувствительный элемент)."
+                )
             reports.append(f"ПАКЕТ КАДРОВ {batch_number}:\n{report}")
         return "\n\n".join(reports), tokens
     except Exception:
         for token in tokens:
             MEDIA_FILES.pop(token, None)
         raise
+
+
+POLICY_REFUSAL_MARKERS = (
+    "prohibited use policy", "sensitive words", "could not be submitted",
+    "generative ai prohibited", "content policy", "safety policy",
+    "cannot generate", "cannot create", "i cannot assist", "i can't help with that",
+    "against our usage policies", "policy violation", "violates google",
+    "i'm not able to", "i am not able to", "i won't be able to",
+    "нарушает политику", "против политики", "не могу сгенерировать",
+    "не могу создать", "запрещённый контент", "не соответствует политике",
+    "не могу помочь с этим запросом", "против правил использования",
+)
+
+
+def is_refusal(text: str) -> bool:
+    """True when a model response is a policy/safety refusal rather than the
+    actual requested content (analysis, scenario, or prompt text)."""
+    lowered = text.lower()
+    return any(marker in lowered for marker in POLICY_REFUSAL_MARKERS)
 
 
 async def analyze_video(
@@ -788,13 +828,14 @@ async def analyze_video(
         )
         looks_empty = any(marker in lowered for marker in error_markers)
         looks_blind = any(marker in lowered for marker in no_video_markers)
+        looks_refused = is_refusal(result)
         # A genuine per-shot breakdown for a real video is long. A refusal or
         # "I can't see it" reply is almost always short — use that as a second
         # signal so phrasings not covered by the lists above are still caught.
         looks_too_short = len(result.strip()) < 400
-        if looks_empty or looks_blind or looks_too_short:
+        if looks_empty or looks_blind or looks_refused or looks_too_short:
             raise RuntimeError(
-                "Прямой анализ видео по ссылке не удался (пустой/короткий/отрицающий ответ модели)"
+                "Прямой анализ видео по ссылке не удался (пустой/короткий/отрицающий/отказной ответ модели)"
             )
         return result, []
     except RuntimeError:
@@ -863,7 +904,7 @@ async def terra_text(instruction: str, content: str, effort: str = "medium") -> 
         # The Codex-compatible Kie endpoint can occasionally keep an SSE
         # connection open indefinitely. Cap the whole request and then use the
         # already configured Gemini endpoint as a text-only fallback.
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             kie_request(
                 "https://api.kie.ai/codex/v1/responses",
                 payload,
@@ -872,6 +913,9 @@ async def terra_text(instruction: str, content: str, effort: str = "medium") -> 
             ),
             timeout=300.0,
         )
+        if is_refusal(result):
+            raise RuntimeError("Codex endpoint refused the request")
+        return result
     except (asyncio.TimeoutError, RuntimeError, httpx.HTTPError):
         fallback_payload = {
             "messages": [
@@ -884,12 +928,19 @@ async def terra_text(instruction: str, content: str, effort: str = "medium") -> 
             "include_thoughts": False,
             "reasoning_effort": effort,
         }
-        return await kie_request(
+        result = await kie_request(
             "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
             fallback_payload,
             attempts=2,
             timeout_seconds=300.0,
         )
+        if is_refusal(result):
+            raise RuntimeError(
+                "Модель отказалась выполнить запрос из-за политики безопасности "
+                "(вероятно, в видео есть элемент, который она сочла чувствительным: "
+                "оружие, насилие и т.п.)."
+            )
+        return result
 
 
 async def create_scenario(meta: dict[str, Any], transcript: str, visual: str) -> str:
@@ -905,26 +956,30 @@ async def create_scenario(meta: dict[str, Any], transcript: str, visual: str) ->
     return (await terra_text(SCENARIO_SYSTEM, content, "high")).strip()
 
 
-SEEDANCE_SYSTEM = """Преобразуй точный реконструированный сценарий в полный комплект промптов Seedance 2.0.
+SEEDANCE_SYSTEM = """Преобразуй точный реконструированный сценарий в готовые промпты Seedance 2.0.
 Не добавляй ничего, чего нет в сценарии. Не пиши отрицательные действия вроде «не замирает»;
 описывай только фактическое положительное действие. Сохраняй точные реплики, планы, склейки,
 эмоции, жесты, направления взглядов и отдельные появления VFX.
 
 Каждая генерация максимум 15 секунд. Длинный ролик раздели по монтажным склейкам или сменам
 говорящего. Каждая часть должна быть самостоятельной и содержать:
-1. Объявление @image1, @image2... в порядке прикрепления.
-2. Только действительно необходимые критические ограничения.
-3. Photorealistic cinematic film quality; not cartoon, not plastic.
-4. Vertical 9:16 и точное число шотов.
+1. В самом начале одной строкой — на что ссылаются @image1, @image2 и т.д. (кто/что на
+   референсе), без отдельного развёрнутого раздела под это.
+2. Только действительно необходимые критические ограничения (1–3 пункта, не более).
+3. Фотореалистичное кинематографическое качество; не мультфильм, не пластик.
+4. Вертикальный формат 9:16 и точное число шотов.
 5. Каждый Shot с таймкодом, крупностью, камерой, положением LEFT/RIGHT/center, фоном,
-   последовательным действием, эмоцией и дословной русской репликой.
-6. Audio: русские голоса для lip-sync, все реплики и звуки по порядку, музыка только если есть.
-7. Lighting.
+   последовательным действием, эмоцией и дословной репликой — сама раскадровка по шотам
+   и есть детализация плана, отдельную таблицу раскадровки строить не нужно.
+6. Audio: голоса для lip-sync, все реплики и звуки по порядку, музыка только если есть.
+7. Освещение.
 8. Финальная строка: X seconds. Vertical 9:16. 720p. 24fps.
-9. Порядок прикрепления референсов.
 
-Сначала выдай список референсов, затем таблицу раскадровки, затем ПОЛНЫЕ английские промпты
-в код-блоках, затем их ПОЛНЫЙ русский перевод. Никогда не давай фрагменты для вставки."""
+Пиши ТОЛЬКО на русском языке — не давай английскую версию вообще, даже частично.
+Не создавай отдельный раздел со списком референсов и не создавай таблицу раскадровки —
+вся нужная детализация уже находится внутри самих Shot по порядку. Не пиши вступления и
+заключения — начинай сразу с первой части и заканчивай последней строкой последнего шота.
+Каждую самостоятельную часть оформляй отдельным блоком в тройных обратных кавычках."""
 
 
 async def create_seedance(scenario: str) -> str:
@@ -1193,8 +1248,8 @@ async def command_revise(message: Message, command: CommandObject) -> None:
         updated = await revise_scenario(path.read_text(encoding="utf-8"), correction)
         path.write_text(updated, encoding="utf-8")
         await DB.save_revision(job["job_id"])
-        await status.edit_text("Готово. Полный исправленный сценарий:")
-        for chunk in split_text(updated):
+        await status.edit_text("Готово.")
+        for chunk in chunks_with_intro("Исправленный сценарий (файл приложен):", updated):
             await message.answer(chunk)
         await message.answer_document(FSInputFile(path, filename=f"scenario-{job['job_id'][:8]}.md"))
     except Exception as exc:
@@ -1217,8 +1272,8 @@ async def callback_seedance(callback: CallbackQuery) -> None:
         result = await create_seedance(scenario)
         path = Path(job["scenario_path"]).with_name("seedance-prompts.md")
         path.write_text(result, encoding="utf-8")
-        await status.edit_text("Готово. Полные промпты приложены файлом.")
-        for chunk in split_text(result):
+        await status.edit_text("Готово.")
+        for chunk in chunks_with_intro("Промпт Seedance 2.0 (файл приложен):", result):
             await callback.message.answer(chunk)
         await callback.message.answer_document(FSInputFile(path, filename=f"seedance-{job_id[:8]}.md"))
     except Exception as exc:
@@ -1236,6 +1291,17 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
     async def status(text: str) -> None:
         with suppress(Exception):
             await BOT.edit_message_text(text, chat_id=chat_id, message_id=status_id)
+
+    async def keep_typing() -> None:
+        # Telegram's native "typing…" indicator already animates with dots and
+        # fades after ~5s, so we just need to keep refreshing it — this reads
+        # as continuous activity without editing the status text every second.
+        with suppress(Exception):
+            while True:
+                await BOT.send_chat_action(chat_id, ChatAction.TYPING)
+                await asyncio.sleep(4.0)
+
+    typing_task = asyncio.create_task(keep_typing())
 
     async with WORK_SEMAPHORE:
         try:
@@ -1303,14 +1369,14 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
             seedance_path = job_dir / "seedance-prompts.md"
             seedance_path.write_text(seedance, encoding="utf-8")
             await DB.complete(job_id, scenario_path)
+            await status("5/5 — Готово.")
 
-            await status("5/5 — Готово. Ниже промпты Seedance 2.0; файл также приложен.")
-            for chunk in split_text(seedance):
+            for chunk in chunks_with_intro("Промпт Seedance 2.0 (файл приложен):", seedance):
                 await BOT.send_message(chat_id, chunk)
             await BOT.send_document(
                 chat_id,
                 FSInputFile(seedance_path, filename=f"seedance-{job_id[:8]}.md"),
-                caption="Готовые промпты для Seedance 2.0.",
+                caption="Промпт Seedance 2.0.",
             )
         except Exception as exc:
             if charged:
@@ -1320,6 +1386,9 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
             await status("Обработка не завершилась. Списанные токены возвращены автоматически.")
             await BOT.send_message(chat_id, "Причина: " + str(exc)[-1200:])
         finally:
+            typing_task.cancel()
+            with suppress(Exception):
+                await typing_task
             for media_token in media_tokens:
                 MEDIA_FILES.pop(media_token, None)
             if job_dir.exists():
@@ -1400,10 +1469,9 @@ async def lifespan(_: FastAPI):
         raise RuntimeError("TELEGRAM_BOT_TOKEN не настроен")
     await BOT.set_my_commands(
         [
-            BotCommand(command="start", description="Запустить бота"),
-            BotCommand(command="balance", description="Баланс видеотокенов"),
-            BotCommand(command="buy", description="Пополнить баланс"),
-            BotCommand(command="revise", description="Исправить последний сценарий"),
+            BotCommand(command="start", description="🚀 Запустить бота"),
+            BotCommand(command="balance", description="💰 Баланс видеотокенов"),
+            BotCommand(command="buy", description="⭐ Пополнить баланс"),
             BotCommand(command="privacy", description="Обработка и хранение видео"),
             BotCommand(command="terms", description="Условия использования"),
             BotCommand(command="support", description="Поддержка"),
