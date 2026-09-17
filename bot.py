@@ -780,9 +780,16 @@ POLICY_REFUSAL_MARKERS = (
 
 
 def is_refusal(text: str) -> bool:
-    """True when a model response is a policy/safety refusal rather than the
-    actual requested content (analysis, scenario, or prompt text)."""
-    lowered = text.lower()
+    """True only when the response as a whole looks like a refusal — short,
+    with a refusal phrase in it. A genuine analysis/scenario/prompt is always
+    long (that's what the system prompts demand), so gating on length first
+    prevents false positives from a stray hedge phrase inside real, valid,
+    long output (that was the bug: matching the marker anywhere in the text,
+    with no length check, flagged perfectly good long responses as refusals)."""
+    stripped = text.strip()
+    if len(stripped) > 600:
+        return False
+    lowered = stripped.lower()
     return any(marker in lowered for marker in POLICY_REFUSAL_MARKERS)
 
 
