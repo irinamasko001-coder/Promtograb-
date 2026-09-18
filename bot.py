@@ -238,8 +238,13 @@ class Database:
             row = await (await db.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))).fetchone()
             created = row is None
             if created:
+                # Columns are named explicitly: a positional INSERT breaks the
+                # moment the table gains a column (that is exactly what the
+                # `engine` migration did — every user lookup started failing,
+                # so the bot stopped responding to anything).
                 await db.execute(
-                    "INSERT INTO users VALUES(?,?,?,?,0,?,?)",
+                    "INSERT INTO users(user_id,username,display_name,balance,consented,"
+                    "created_at,updated_at) VALUES(?,?,?,?,0,?,?)",
                     (user_id, username, name, S.starting_tokens, now_iso(), now_iso()),
                 )
                 if S.starting_tokens:
@@ -395,7 +400,7 @@ class Database:
                 await db.rollback()
                 return False
             await db.execute(
-                "INSERT INTO payments VALUES(?,?,?,?,?,0,?)",
+                "INSERT INTO payments(charge_id,user_id,payload,stars,tokens,refunded,created_at) VALUES(?,?,?,?,?,0,?)",
                 (charge_id, user_id, payload, stars, tokens, now_iso()),
             )
             await db.execute("UPDATE users SET balance=balance+?,updated_at=? WHERE user_id=?", (tokens, now_iso(), user_id))
