@@ -54,12 +54,14 @@ class Settings:
     max_upload_mb: int = int(os.getenv("MAX_UPLOAD_MB", "50"))
     starting_tokens: int = int(os.getenv("STARTING_TOKENS", "30"))
     tokens_per_second: int = int(os.getenv("TOKENS_PER_SECOND", "1"))
+    tokens_per_photo: int = int(os.getenv("TOKENS_PER_PHOTO", "5"))
     public_base_url: str = os.getenv("PUBLIC_BASE_URL", "")
     payments_enabled: bool = env_bool("PAYMENTS_ENABLED", False)
     support_username: str = os.getenv("SUPPORT_USERNAME", "@support")
     transcription_model: str = os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe")
     kie_visual_model: str = os.getenv("KIE_VISUAL_MODEL", "gemini-3-8-flash")
     kie_final_model: str = os.getenv("KIE_FINAL_MODEL", "gpt-5-6-terra")
+    openai_text_model: str = os.getenv("OPENAI_TEXT_MODEL", "gpt-5.6-terra")
     moderation_model: str = os.getenv("MODERATION_MODEL", "omni-moderation-latest")
     moderation_enabled: bool = env_bool("MODERATION_ENABLED", True)
 
@@ -335,6 +337,27 @@ class Database:
             await db.execute("UPDATE jobs SET revisions=revisions+1,updated_at=? WHERE job_id=?", (now_iso(), job_id))
             await db.commit()
 
+    async def charge(self, user_id: int, amount: int, reason: str) -> bool:
+        """Deduct a flat fee (photo/idea prompts). Owner is never charged."""
+        if user_id == S.owner_id:
+            return True
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))).fetchone()
+            if not row or int(row[0]) < amount:
+                await db.commit()
+                return False
+            await db.execute(
+                "UPDATE users SET balance=balance-?,updated_at=? WHERE user_id=?",
+                (amount, now_iso(), user_id),
+            )
+            await db.execute(
+                "INSERT INTO ledger(user_id,delta,reason,reference,created_at) VALUES(?,?,?,?,?)",
+                (user_id, -amount, reason, None, now_iso()),
+            )
+            await db.commit()
+            return True
+
     async def grant(self, user_id: int, amount: int, reference: str = "owner_grant") -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -433,18 +456,20 @@ async def extract_analysis_frames(video: Path, target_dir: Path, duration: float
     else:
         fps = 0.5
     frame_count = min(180, max(2, math.ceil(duration * fps) + 1))
-    end = max(0.0, duration - 0.04)
-    timestamps = [i * end / (frame_count - 1) for i in range(frame_count)]
+    # Extract every frame in ONE ffmpeg pass. The previous version spawned a
+    # separate ffmpeg process per frame (31+ processes for a 10s clip, each
+    # re-opening and seeking the file) which dominated total runtime.
+    await run_command(
+        "ffmpeg", "-y", "-i", str(video),
+        "-vf", f"fps={fps},scale='min(768,iw)':-2",
+        "-pix_fmt", "yuvj420p", "-threads", "1", "-q:v", "3",
+        str(target_dir / "frame-%04d.jpg"),
+    )
+    extracted = sorted(target_dir.glob("frame-*.jpg"))
     frames: list[tuple[float, Path]] = []
-    for index, timestamp in enumerate(timestamps):
-        output = target_dir / f"frame-{index:04d}.jpg"
-        await run_command(
-            "ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(video),
-            "-frames:v", "1", "-vf", "scale='min(768,iw)':-2",
-            "-pix_fmt", "yuvj420p", "-threads", "1", "-q:v", "3", str(output)
-        )
-        if output.exists() and output.stat().st_size:
-            frames.append((timestamp, output))
+    for index, path in enumerate(extracted[:frame_count]):
+        if path.exists() and path.stat().st_size:
+            frames.append((index / fps, path))
     if not frames:
         raise RuntimeError("Не удалось извлечь кадры из видео")
     return frames
@@ -662,19 +687,15 @@ async def moderation_frames(video: Path, duration: float, target_dir: Path) -> l
     (not for the full visual analysis)."""
     target_dir.mkdir(parents=True, exist_ok=True)
     count = min(6, max(2, math.ceil(duration / 5)))
-    end = max(0.0, duration - 0.04)
-    timestamps = [i * end / max(1, count - 1) for i in range(count)]
-    frames: list[Path] = []
-    for index, timestamp in enumerate(timestamps):
-        output = target_dir / f"mod-{index:02d}.jpg"
-        await run_command(
-            "ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(video),
-            "-frames:v", "1", "-vf", "scale='min(512,iw)':-2",
-            "-pix_fmt", "yuvj420p", "-threads", "1", "-q:v", "5", str(output),
-        )
-        if output.exists() and output.stat().st_size:
-            frames.append(output)
-    return frames
+    # Single ffmpeg pass (was one process per frame).
+    rate = max(count / duration, 0.01) if duration > 0 else 1.0
+    await run_command(
+        "ffmpeg", "-y", "-i", str(video),
+        "-vf", f"fps={rate:.4f},scale='min(512,iw)':-2",
+        "-pix_fmt", "yuvj420p", "-threads", "1", "-q:v", "5",
+        str(target_dir / "mod-%02d.jpg"),
+    )
+    return [p for p in sorted(target_dir.glob("mod-*.jpg"))[:count] if p.stat().st_size]
 
 
 async def check_moderation(frames: list[Path]) -> bool:
@@ -682,7 +703,8 @@ async def check_moderation(frames: list[Path]) -> bool:
     Moderation-service failures never block processing — only an explicit flag does."""
     if not S.moderation_enabled or not OPENAI or not frames:
         return False
-    for frame in frames:
+
+    async def flagged(frame: Path) -> bool:
         data_url = "data:image/jpeg;base64," + base64.b64encode(frame.read_bytes()).decode("ascii")
         try:
             result = await OPENAI.moderations.create(
@@ -690,12 +712,16 @@ async def check_moderation(frames: list[Path]) -> bool:
                 input=[{"type": "image_url", "image_url": {"url": data_url}}],
             )
         except Exception:
-            continue
+            return False
         for item in result.results:
             categories = item.categories
             if getattr(categories, "sexual", False) or getattr(categories, "sexual_minors", False):
                 return True
-    return False
+        return False
+
+    # Check every frame at once instead of one-by-one.
+    results = await asyncio.gather(*(flagged(f) for f in frames), return_exceptions=True)
+    return any(r is True for r in results)
 
 
 VISUAL_PROMPT = """Проанализируй ПРИКРЕПЛЁННОЕ ВИДЕО целиком как режиссёр монтажа. Ничего не додумывай.
@@ -729,36 +755,49 @@ async def analyze_frame_batches(
 ) -> tuple[str, list[str]]:
     """Analyze timestamped frames in ordered batches."""
     tokens: list[str] = []
-    reports: list[str] = []
-    try:
-        for batch_number, start in enumerate(range(0, len(frames), 12), 1):
-            batch = frames[start:start + 12]
-            content: list[dict[str, Any]] = [{
-                "type": "text",
-                "text": (
-                    VISUAL_PROMPT
-                    + "\n\nНиже идут последовательные кадры исходного ролика. Перед каждым "
-                    "указан точный таймкод. Анализируй только этот диапазон, сохраняя порядок. "
-                    f"Пакет {batch_number}; границы склеек детектора: "
-                    + ", ".join(f"{value:.3f}" for value in cut_points)
-                    + "."
-                ),
-            }]
-            for timestamp, path in batch:
-                data_url = "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
-                content.append({"type": "text", "text": f"Кадр, таймкод {timestamp:.3f} с:"})
-                content.append({"type": "image_url", "image_url": {"url": data_url}})
-            report = await kie_request(
-                "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
-                visual_payload(content), attempts=3, timeout_seconds=300.0,
+    batches = [frames[start:start + 12] for start in range(0, len(frames), 12)]
+
+    async def analyze_batch(batch_number: int, batch: list[tuple[float, Path]]) -> str:
+        content: list[dict[str, Any]] = [{
+            "type": "text",
+            "text": (
+                VISUAL_PROMPT
+                + "\n\nНиже идут последовательные кадры исходного ролика. Перед каждым "
+                "указан точный таймкод. Анализируй только этот диапазон, сохраняя порядок. "
+                f"Пакет {batch_number}; границы склеек детектора: "
+                + ", ".join(f"{value:.3f}" for value in cut_points)
+                + ".\n\nКРИТИЧЕСКИ ВАЖНО: это НЕ набор отдельных фотографий, а "
+                "последовательность моментов одного непрерывного движения. Твоя главная "
+                "задача — описать, что ПРОИСХОДИТ МЕЖДУ кадрами: какое действие началось, "
+                "как оно развивается и чем заканчивается. Сравнивай каждый кадр с предыдущим "
+                "и описывай изменение как непрерывное действие с глаголами движения "
+                "(«поднимает», «срезает», «падает», «подбегает»), а не как статичное "
+                "состояние («держит», «находится», «стоит»). Если между двумя кадрами "
+                "предмет изменил положение — значит произошло действие, назови его. Не пиши "
+                "покадровый список — пиши связное описание происходящего по таймкодам."
+            ),
+        }]
+        for timestamp, path in batch:
+            data_url = "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+            content.append({"type": "text", "text": f"Кадр, таймкод {timestamp:.3f} с:"})
+            content.append({"type": "image_url", "image_url": {"url": data_url}})
+        report = await kie_request(
+            "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
+            visual_payload(content), attempts=3, timeout_seconds=300.0,
+        )
+        if is_refusal(report):
+            raise RuntimeError(
+                "Модель отказалась анализировать видео из-за политики безопасности "
+                "(возможно, в кадре что-то похожее на оружие, насилие или другой "
+                "чувствительный элемент)."
             )
-            if is_refusal(report):
-                raise RuntimeError(
-                    "Модель отказалась анализировать видео из-за политики безопасности "
-                    "(возможно, в кадре что-то похожее на оружие, насилие или другой "
-                    "чувствительный элемент)."
-                )
-            reports.append(f"ПАКЕТ КАДРОВ {batch_number}:\n{report}")
+        return f"ПАКЕТ КАДРОВ {batch_number}:\n{report}"
+
+    try:
+        # Analyze all batches concurrently instead of one after another.
+        reports = await asyncio.gather(
+            *(analyze_batch(n, b) for n, b in enumerate(batches, 1))
+        )
         return "\n\n".join(reports), tokens
     except Exception:
         for token in tokens:
@@ -893,6 +932,76 @@ SCENARIO_SYSTEM = """Ты создаёшь точную реконструкци
 Пиши по-русски, подробно и профессионально. Верни полный сценарий целиком."""
 
 
+async def openai_text(instruction: str, content: str) -> str:
+    """Text-only generation via OpenAI. Used as a fallback when the Kie
+    endpoints refuse or fail — OpenAI's policy filters are considerably less
+    trigger-happy on ordinary creative/scene description than Gemini's."""
+    if not OPENAI:
+        raise RuntimeError("OPENAI_API_KEY не настроен")
+    response = await OPENAI.chat.completions.create(
+        model=S.openai_text_model,
+        messages=[
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": content},
+        ],
+        max_completion_tokens=16000,
+    )
+    text = (response.choices[0].message.content or "").strip()
+    # Mark truncation so callers can request a continuation instead of
+    # silently handing the user a prompt that stops mid-sentence.
+    if response.choices[0].finish_reason == "length":
+        text += TRUNCATION_MARK
+    return text
+
+
+TRUNCATION_MARK = "\u0000TRUNCATED"
+
+
+def looks_unfinished(text: str) -> bool:
+    """Heuristic: did generation stop mid-thought rather than complete?
+    A finished prompt always ends with the mandated final line (fps/format) or
+    at least closes its last sentence."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped.endswith(TRUNCATION_MARK):
+        return True
+    tail = stripped[-200:].lower()
+    if "fps" in tail or "24fps" in tail:
+        return False
+    # Ends mid-word or mid-clause: no terminal punctuation at all.
+    return stripped[-1] not in ".!?»\"')"
+
+
+async def generate_complete(
+    instruction: str, content: str, effort: str = "medium", max_rounds: int = 3
+) -> str:
+    """Run terra_text and, if the answer came back cut off, ask for the rest and
+    stitch it on. Without this the user receives prompts that stop mid-sentence."""
+    result = await terra_text(instruction, content, effort)
+    result = result.replace(TRUNCATION_MARK, "").strip()
+
+    rounds = 0
+    while looks_unfinished(result) and rounds < max_rounds:
+        rounds += 1
+        tail = result[-1500:]
+        continuation = await terra_text(
+            instruction
+            + "\n\nТЫ ПРОДОЛЖАЕШЬ РАНЕЕ НАЧАТЫЙ ОТВЕТ, КОТОРЫЙ ОБОРВАЛСЯ. "
+            "Продолжи ровно с того места, где текст прервался. Не повторяй уже "
+            "написанное, не начинай заново, не пиши вступлений — сразу дальше по тексту "
+            "и доведи промпт до конца, включая финальную строку с форматом и fps.",
+            f"ИСХОДНЫЕ ДАННЫЕ:\n{content}\n\nКОНЕЦ УЖЕ НАПИСАННОГО ТЕКСТА:\n...{tail}",
+            effort,
+        )
+        continuation = continuation.replace(TRUNCATION_MARK, "").strip()
+        if not continuation:
+            break
+        separator = "" if result.endswith(("\n", " ")) else " "
+        result = (result + separator + continuation).strip()
+    return result
+
+
 async def terra_text(instruction: str, content: str, effort: str = "medium") -> str:
     payload = {
         "model": S.kie_final_model,
@@ -933,13 +1042,22 @@ async def terra_text(instruction: str, content: str, effort: str = "medium") -> 
             "stream": False,
             "include_thoughts": False,
             "reasoning_effort": effort,
+            # Without an explicit cap this endpoint used the provider default,
+            # which is far smaller than the primary path's budget — that was
+            # why prompts arrived cut off mid-sentence.
+            "max_tokens": 16000,
         }
-        result = await kie_request(
-            "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
-            fallback_payload,
-            attempts=2,
-            timeout_seconds=300.0,
-        )
+        try:
+            result = await kie_request(
+                "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
+                fallback_payload,
+                attempts=2,
+                timeout_seconds=300.0,
+            )
+        except Exception:
+            # Both Kie endpoints are down/erroring (524, 500, timeouts). These
+            # steps are text-only, so fall back to OpenAI instead of failing.
+            return await openai_text(instruction, content)
         if is_refusal(result):
             # A short refusal-looking reply is sometimes a one-off fluke rather
             # than a real, persistent policy block — retry once before giving
@@ -952,11 +1070,23 @@ async def terra_text(instruction: str, content: str, effort: str = "medium") -> 
                 timeout_seconds=300.0,
             )
         if is_refusal(result):
-            raise RuntimeError(
-                "Модель отказалась выполнить запрос из-за политики безопасности "
-                "(вероятно, в видео есть элемент, который она сочла чувствительным: "
-                "оружие, насилие и т.п.)."
-            )
+            # Both Kie endpoints refused. These are text-only steps (scenario,
+            # prompt), so switch providers entirely rather than failing the job:
+            # OpenAI rarely blocks ordinary scene description that Gemini's
+            # stricter filters flag.
+            try:
+                openai_result = await openai_text(instruction, content)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Оба сервиса отказались выполнить запрос. "
+                    f"Ошибка резервной модели: {str(exc)[-300:]}"
+                ) from exc
+            if is_refusal(openai_result) or not openai_result:
+                raise RuntimeError(
+                    "Запрос отклонён всеми доступными моделями. Попробуйте видео без "
+                    "спорных элементов или переформулируйте правку."
+                )
+            return openai_result
         return result
 
 
@@ -970,96 +1100,232 @@ async def create_scenario(meta: dict[str, Any], transcript: str, visual: str) ->
         "АНАЛИЗ САМОГО ВИДЕО GEMINI:\n"
         f"{visual}"
     )
-    return (await terra_text(SCENARIO_SYSTEM, content, "high")).strip()
+    return (await generate_complete(SCENARIO_SYSTEM, content, "high")).strip()
 
 
-SEEDANCE_SYSTEM = """Преобразуй точный реконструированный сценарий в готовые промпты Seedance 2.0.
-Пиши только на русском языке — английской версии не давай вообще, даже частично.
+SEEDANCE_SYSTEM = """Преобразуй реконструированный сценарий в готовый промпт Seedance 2.0.
+Пиши только на русском языке.
 
-ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: пиши максимально просто и прямо, как инструкцию для нейросети-генератора,
-а не как киноведческий разбор. Короткие прямые предложения. Никакого профессионального
-киножаргона («мизансцена», «полиэкранная композиция», «внутрикадровый монтаж» и подобное) —
-если нужно описать план из нескольких элементов, просто перечисли, что где находится, обычными
-словами. Не усложняй описание движений: вместо длинных цепочек «сгибает, разгибает, ритмично
-двигает в такт» пиши коротко и естественно, например «бежит с реалистичной физикой движений» —
-детали физики нужны только там, где без них план непонятен. Не пиши двусмысленные фразы,
-которые нейросеть может понять наоборот (например «лицо скрыто дистанцией» может быть прочитано
-как указание что-то скрыть) — пиши прямо, что́ видно, а не что не видно.
+САМОЕ ГЛАВНОЕ — НИКАКИХ ВСТУПЛЕНИЙ. Первая строка ответа — уже сам промпт (строка
+"Референсы:"). Запрещено писать «Преобразую сценарий…», «Вот промпт…», «Сохраню точные
+действия…» и любые объяснения того, что ты делаешь. Также никаких заключений в конце.
 
-Не добавляй ничего, чего нет в сценарии. Сохраняй точные реплики, эмоции, ключевые жесты,
-направления взглядов и отдельные появления VFX — но формулируй компактно и без повторов.
+ЯЗЫК — ПРОСТОЙ И ЕСТЕСТВЕННЫЙ
+Пиши так, как человек описывает происходящее, глядя на экран. Нейросеть понимает обычные
+слова — не надо разжёвывать механику движений. Правильно: «правой рукой берёт свечу и убирает
+её из кадра». Неправильно: «отгибает большой и указательный пальцы, подносит кисть под углом
+90 градусов, захватывает свечу». Никакого киножаргона («мизансцена», «полиэкранная
+композиция», «внутрикадровый монтаж») — только обычные слова.
+
+ЭМОЦИИ И РЕПЛИКИ — ВНУТРИ ДЕЙСТВИЯ, А НЕ ОТДЕЛЬНЫМ СПИСКОМ
+Это критично. Нельзя собирать эмоции и реплики в отдельные поля или перечислять их в конце —
+непонятно, к какой секунде они относятся. Эмоция пишется прямо там, где она происходит, внутри
+описания действия того же отрезка времени, и репликa тоже.
+Правильно: «0–3 с: девушка удивлённо смотрит на свечи, брови приподнимаются, правой рукой
+убирает свечу и говорит с лёгкой растерянностью: „Это что такое?“»
+Неправильно: отдельные строки «Эмоция: удивление» и «Реплика: „Это что такое?“» в конце шота.
+
+ДВИЖЕНИЕ, А НЕ ПОЗА
+У действия должно быть начало, развитие и результат: «заносит ножницы, смыкает лезвия,
+срезанные перья падают вниз», а не «держит ножницы у крыла». Глаголы динамические: срезает,
+поднимает, падает, подбегает, разворачивается, уходит. Избегай статичных «держит»,
+«находится», «расположен», «стоит» — если персонаж почти неподвижен, опиши микродвижение
+(дыхание, поворот головы, движение ткани). Действие внутри шота разбивай по секундам и
+показывай, как оно развивается.
 
 ССЫЛКИ НА РЕФЕРЕНСЫ (@image1, @image2…)
-По умолчанию референс даётся только внешности персонажей — один @image на персонажа. НЕ
-создавай референс для предметов/реквизита (торт, оружие, бутылка и т.д.) и НЕ создавай референс
-для локации/фона — обычно отдельного фото под них нет, поэтому просто описывай их текстом внутри
-плана, без номера референса. Референс для отдельного предмета добавляй только если это прямо
-указано в самом сценарии или в правке пользователя как имеющееся фото. В самом начале одной
-строкой перечисли все использованные референсы: «@image1 — кто/что», «@image2 — кто/что» и т.д.,
-коротко.
+Референс — только внешность персонажей, один @image на персонажа. НЕ создавай референс для
+предметов, реквизита, локации или фона — их просто описывай текстом. Первая строка ответа:
+«Референсы: @image1 — кто, @image2 — кто».
 
 ВРЕМЯ
-Округляй все таймкоды до целых секунд (0–2s, 2–5s, 5–9s и т.д.), не пиши доли секунды и
-миллисекунды.
-
-КРИТИЧЕСКИЕ ОГРАНИЧЕНИЯ — ТОЛЬКО КОГДА РЕАЛЬНО НУЖНЫ
-Не добавляй этот блок «на всякий случай». Пиши его только если в кадре одновременно несколько
-персонажей (тогда одной строкой: «В кадре ровно N человек: [список]. Без дублей») или если есть
-специфический технический риск (например, резкая смена стиля кадра посреди плана). Если такого
-риска нет — просто не создавай этот блок вообще.
+Только целые секунды (0–2s, 2–5s, 5–9s). Никаких долей и миллисекунд.
 
 ФОРМАТИРОВАНИЕ — БЕЗ MARKDOWN
-Этот текст пойдёт напрямую в поле промпта Seedance, поэтому НЕ используй звёздочки, решётки,
-обратные кавычки или любую другую markdown-разметку — они попадут в промпт как лишние символы.
-Подписи полей пиши просто через двоеточие, каждый параметр с новой строки, разделяй смысловые
-блоки пустой строкой — это уже даёт понятную структуру без всякой разметки:
+Текст идёт прямо в поле промпта Seedance: никаких звёздочек, решёток и обратных кавычек.
+Подписи полей — через двоеточие, каждый параметр с новой строки.
 
-СТРУКТУРА КАЖДОЙ ЧАСТИ (максимум 15 секунд; длинный ролик дели по склейкам/смене говорящего).
-Если частей несколько — отделяй их строкой «ЧАСТЬ 2», «ЧАСТЬ 3» и т.д. с пустой строкой до и
-после:
+СТРУКТУРА (максимум 15 секунд на часть; длинное видео дели по склейкам, части отделяй
+строкой «ЧАСТЬ 2», «ЧАСТЬ 3»):
 
 Референсы: @image1 — …, @image2 — …
 Стиль: фотореалистичное кинематографическое качество, не мультфильм, не пластик.
 Формат: вертикальный 9:16, N шотов.
 
 Shot 1 (0–Ns)
-Крупность: (простыми словами: крупный план лица / по пояс / в полный рост)
-Камера: где стоит и как снимает, простыми словами
+Крупность: простыми словами — крупный план лица / по пояс / в полный рост
+Камера: где стоит и как снимает
 Положение: кто где — LEFT / RIGHT / center
-Фон: одной фразой, что видно позади (обязательно, если герой один в кадре)
-Действие: что происходит, по порядку, простыми предложениями
-Эмоция: что видно на лице — глаза, брови, губы (без одного слова вроде «грустная»)
-Реплика: тон голоса коротко + сама реплика в кавычках
-VFX: только если реально есть эффект
+Фон: одной фразой, что видно позади (обязательно, если герой один в кадре; если фон не
+менялся — «тот же фон»)
+Действие: посекундно, с эмоциями и репликами внутри текста (см. правило выше)
+VFX: только если эффект реально есть
 
-Если персонаж обращается к кому-то за кадром — одной строкой укажи, где этот кто-то за кадром
-(LEFT/RIGHT) и куда смотрит говорящий; если адресат — зритель, пиши, что взгляд направлен в
-камеру. Фон не переописывай заново, если он не поменялся с предыдущего Shot — пиши «тот же фон».
-Внешность персонажа заново не пересказывай — она уже дана в референсах, в Shot ссылайся на
-@imageN.
+Критические ограничения добавляй ТОЛЬКО когда они нужны: если в кадре несколько персонажей —
+одной строкой «В кадре ровно N человек: [список]. Без дублей». Если риска нет — блока нет.
 
-Audio: тип голоса + реплики по порядку + окружающие звуки; «без музыки», если музыки нет.
+Если персонаж обращается к кому-то за кадром, укажи, где тот находится (LEFT/RIGHT) и куда
+смотрит говорящий; если адресат — зритель, взгляд направлен в камеру.
+
+Audio: тип голоса, реплики по порядку, окружающие звуки; «без музыки», если музыки нет.
 Свет: одна-две фразы.
 
 Финальная строка: X seconds. Vertical 9:16. 720p. 24fps.
 
-СЛОВ-ТРИГГЕРОВ ИЗБЕГАЙ (могут заблокировать генерацию):
-— слова «юная/подросток/несовершеннолетн*» в описании внешности;
+СЛОВА-ТРИГГЕРЫ, КОТОРЫХ ИЗБЕГАЙ (блокируют генерацию):
+— «юная», «подросток», «несовершеннолетн*» в описании внешности;
 — «текстура кожи», «поры»;
-— анатомические термины вроде «грудь» — опиши силуэт или одежду вместо этого;
-— «светящиеся/сверкающие глаза» — вместо этого «яркие глаза», «широко раскрытые глаза»;
-— КАПСЛОК в описании эмоций — обычный регистр;
-— подряд несколько слов про злость/издёвку/травлю — разбавляй нейтральной лексикой;
-— студийные имена и узнаваемые визуальные атрибуты персонажей известных франшиз — называй
-  персонажа по роли («бог подземного царства», «девушка в сиреневом платье»), а не собственным
-  именем конкретной франшизы.
+— анатомические термины вроде «грудь» — опиши силуэт или одежду;
+— «светящиеся/сверкающие глаза» — пиши «яркие глаза», «широко раскрытые глаза»;
+— КАПСЛОК в эмоциях;
+— несколько слов про злость/издёвку подряд — разбавляй нейтральной лексикой;
+— имена персонажей известных франшиз — называй по роли («девушка в сиреневом платье»)."""
 
-Не пиши вступления и заключения — начинай сразу с первой части и заканчивай последней строкой
-последнего шота."""
+
+GROK_SYSTEM = """Преобразуй реконструированный сценарий в промпт для Grok Imagine Video.
+Пиши только на русском языке.
+
+НИКАКИХ ВСТУПЛЕНИЙ И ЗАКЛЮЧЕНИЙ. Первая строка — уже сам промпт.
+
+Grok устроен иначе, чем Seedance: ему НЕ нужна посекундная раскадровка по шотам, поля с
+подписями и таблицы. Нужен компактный связный текст, максимум 2–3 абзаца.
+
+Формула Grok: субъект → действие и движение → движение камеры → визуальный стиль → звук.
+Самое важное ставь в первые 20–30 слов: Grok сильнее всего опирается на начало промпта.
+
+Пиши так, будто смотришь на человека и описываешь, что он делает и что при этом чувствует —
+естественными словами, коротко. Эмоция идёт прямо внутри действия: «девушка удивлённо смотрит
+на свечи и подаётся вперёд», а не отдельным полем «Эмоция: удивление». Реплики — там же по
+ходу текста, а не списком в конце.
+
+Обязательно укажи: что именно движется в кадре, как движется камера, визуальный стиль одним
+определением (не смешивай несколько эстетик), звук, примерную длительность («~10 секунд») и
+вертикальный формат 9:16.
+
+Не пиши механику движений по суставам и градусам — нейросеть понимает обычный язык.
+Динамические глаголы обязательны: подбегает, срезает, разворачивается, падает.
+
+Избегай слов-триггеров: «юная», «подросток», «текстура кожи», «поры», анатомических терминов,
+«светящиеся глаза», КАПСЛОКА в эмоциях, имён персонажей известных франшиз."""
+
+
+PHOTO_SKIN_BLOCK = (
+    "Ultra-realistic expensive-looking skin with: visible pores, soft peach fuzz, realistic "
+    "skin texture, subtle tonal variation, subsurface scattering on skin, authentic facial "
+    "asymmetry. Skin must look healthy and professionally cared for, like after high-end "
+    "cosmetology and luxury skincare treatments. Warm golden undertones with realistic depth "
+    "and glow. Natural glossy highlights from lighting. No over-smoothing, no plastic texture, "
+    "no CGI perfection, no fake beauty-filter effect."
+)
+
+
+PHOTO_SYSTEM = f"""Создай промпт для генерации фотографии. Пиши на русском языке.
+
+НИКАКИХ ВСТУПЛЕНИЙ И ЗАКЛЮЧЕНИЙ. Первая строка — уже сам промпт.
+
+СТРОГАЯ СТРУКТУРА (соблюдай порядок и подписи):
+
+Используйте лицо со справочного фото: сохраните точные черты лица (форму лица, глаза, брови,
+нос, губы, скулы), выражение и общее сходство. НЕ меняй идентичность лица. Цвет волос и длина
+строго как на референсе.
+
+• {PHOTO_SKIN_BLOCK}
+
+• ОПИСАНИЕ ОБЪЕКТА:
+Волосы:
+Макияж:
+Одежда:
+Украшения:
+
+• ПОЗА И ДЕЙСТВИЕ:
+
+• ОКРУЖЕНИЕ:
+
+• ОСВЕЩЕНИЕ:
+
+• ТЕХНИКА:
+
+• Ракурс:
+
+• План:
+
+ВАЖНЫЕ ПРАВИЛА:
+
+1. Блок про кожу вставляй дословно как есть, на английском, ничего в нём не меняя.
+
+2. НИКОГДА не указывай цвет волос и цвет глаз — они берутся с референса. Описывай только
+длину, текстуру и укладку: «волнистые волосы до плеч», «прямые собранные в хвост», «короткая
+стрижка». Слова «блондинка», «русые», «карие глаза» запрещены.
+
+3. Если в кадре несколько людей — блок «ОПИСАНИЕ ОБЪЕКТА» повторяется для каждого: «ОПИСАНИЕ
+ОБЪЕКТА 1», «ОПИСАНИЕ ОБЪЕКТА 2», у каждого свои волосы, макияж, одежда, украшения.
+
+4. КАМЕРУ подбирай сам под сюжет, строго из трёх вариантов, копируя блоки дословно:
+
+Canon G7X (контрастный, вечеринки, ночь, эффект плёнки, 2000-е):
+ОСВЕЩЕНИЕ: контрастное драматичное освещение со встроенной вспышкой, снятое на Canon G7X.
+ТЕХНИКА: Canon G7X, flash, 2000s aesthetic, Kodak Portra 400 film effect, film grain, halation,
+vignette, analog mood, candid aesthetic, Instagram photo, Pinterest aesthetic, RAW photo.
+Не размывать фон!
+
+iPhone (повседневное, лайфстайл, дневной свет):
+ОСВЕЩЕНИЕ: мягкое рассеянное естественное освещение.
+ТЕХНИКА: iPhone shot, casual lifestyle aesthetic, Instagram photo, Pinterest aesthetic, RAW photo.
+Не размывать фон!
+
+Sony A7 III (только студийная съёмка):
+ОСВЕЩЕНИЕ: освещение с мягким рассеянным светом, зернистость, студийный свет.
+ТЕХНИКА: Sony A7 III, 85mm f/1.8, студийный свет, мягкие тени, чёткие детали, кинематографичный,
+лёгкое зерно, RAW photo, высокая детализация.
+
+5. РАКУРС выбирай из: анфас (эмоции, портрет), профиль (романтично, задумчиво), три четверти
+(самый живой), снизу (сила, значимость), сверху (нежность, хрупкость), со спины (загадочность),
+через плечо (эффект присутствия).
+
+6. ПЛАН выбирай из: общий (в полный рост, видно окружение), средний (от пояса, видна одежда и
+поза), крупный (лицо и плечи, акцент на эмоции), детальный макро (глаза, губы), американский
+(от колен, для динамики).
+
+7. Сочетай осмысленно: крупный + анфас = портрет и эмоция; средний + профиль = задумчивость;
+общий + снизу = эпичность; крупный + сверху = нежность.
+
+8. Пиши простыми словами, без киножаргона и разжёвывания механики движений."""
+
+
+IDEA_SYSTEM = PHOTO_SYSTEM + """
+
+ОСОБЕННОСТЬ ЭТОГО РЕЖИМА: фотографии нет, есть только текстовая идея пользователя. Разверни её
+в полноценный промпт по структуре выше, додумывая недостающие детали сцены (окружение, одежду,
+позу, свет) так, чтобы они логично подходили к идее. Строку про сохранение лица с референса
+оставляй в промпте всегда — пользователь приложит своё фото при генерации."""
+
+
+async def create_grok(scenario: str) -> str:
+    return (await generate_complete(GROK_SYSTEM, "РЕКОНСТРУИРОВАННЫЙ СЦЕНАРИЙ:\n" + scenario, "medium")).strip()
+
+
+async def create_photo_prompt(description: str) -> str:
+    return (await generate_complete(PHOTO_SYSTEM, "ОПИСАНИЕ ФОТО:\n" + description, "medium")).strip()
+
+
+async def create_idea_prompt(idea: str) -> str:
+    return (await generate_complete(IDEA_SYSTEM, "ИДЕЯ ПОЛЬЗОВАТЕЛЯ:\n" + idea, "medium")).strip()
+
+
+async def translate_prompt(prompt: str) -> str:
+    instruction = (
+        "Переведи промпт на английский язык. Никаких вступлений и комментариев — только сам "
+        "перевод. Сохрани структуру, подписи полей и порядок строк. Технические блоки, которые "
+        "уже на английском, оставь без изменений. Собственные термины генерации (RAW photo, "
+        "film grain, Vertical 9:16, 24fps и подобные) не переводи."
+    )
+    return (await generate_complete(instruction, prompt, "medium")).strip()
 
 
 async def create_seedance(scenario: str) -> str:
-    return (await terra_text(SEEDANCE_SYSTEM, "РЕКОНСТРУИРОВАННЫЙ СЦЕНАРИЙ:\n" + scenario, "high")).strip()
+    # "medium" rather than "high": this step reformats an already-written
+    # scenario, so extra reasoning depth adds little but costs real time.
+    return (await generate_complete(SEEDANCE_SYSTEM, "РЕКОНСТРУИРОВАННЫЙ СЦЕНАРИЙ:\n" + scenario, "medium")).strip()
 
 
 async def revise_scenario(scenario: str, correction: str) -> str:
@@ -1068,7 +1334,7 @@ async def revise_scenario(scenario: str, correction: str) -> str:
         "а не отдельный фрагмент. Сохрани все остальные утверждённые детали."
     )
     content = f"ПРАВКА ПОЛЬЗОВАТЕЛЯ:\n{correction}\n\nТЕКУЩИЙ СЦЕНАРИЙ:\n{scenario}"
-    return (await terra_text(instruction, content, "high")).strip()
+    return (await generate_complete(instruction, content, "high")).strip()
 
 
 async def revise_seedance(prompt: str, correction: str) -> str:
@@ -1077,7 +1343,7 @@ async def revise_seedance(prompt: str, correction: str) -> str:
         "а не отдельный фрагмент. Сохрани все остальные утверждённые детали, которые правка не касается."
     )
     content = f"ПРАВКА ПОЛЬЗОВАТЕЛЯ:\n{correction}\n\nТЕКУЩИЙ ПРОМПТ:\n{prompt}"
-    return (await terra_text(instruction, content, "high")).strip()
+    return (await generate_complete(instruction, content, "high")).strip()
 
 
 BOT = Bot(S.telegram_token) if S.telegram_token else None
@@ -1113,14 +1379,78 @@ def scenario_keyboard(job_id: str) -> InlineKeyboardMarkup:
 def seedance_keyboard(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Исправить промпт", callback_data=f"revise_prompt:{job_id}")]
+            [InlineKeyboardButton(text="✏️ Исправить промпт", callback_data=f"revise_prompt:{job_id}")],
+            [InlineKeyboardButton(text="🇬🇧 Перевести на английский", callback_data=f"translate:{job_id}")],
         ]
     )
+
+
+WELCOME_TEXT = (
+    "🎬 VideoPrompt\n"
+    "Превращаю видео и фото в готовые промпты для нейросетей.\n\n"
+    "Что умею:\n"
+    "🎬 Промпт для видео — пришлите видео или ссылку, получите промпт "
+    "для Seedance 2.0 / 2.5 или Grok с раскадровкой по секундам\n"
+    "🖼 Промпт по фото — пришлите фото, получите промпт для генерации изображения\n"
+    "💡 Промпт по описанию — опишите идею словами, соберу промпт с нуля\n\n"
+    "Каждый промпт можно исправить или перевести на английский прямо в чате.\n\n"
+    "Баланс и пополнение — /balance\n\n"
+    "Выберите режим ниже 👇"
+)
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🖼 Промпт по фото", callback_data="mode:photo")],
+            [InlineKeyboardButton(text="💡 Промпт по описанию", callback_data="mode:idea")],
+            [InlineKeyboardButton(text="🎬 Промпт для видео", callback_data="mode:video")],
+        ]
+    )
+
+
+def video_engine_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎬 Seedance 2.0 / 2.5", callback_data="engine:seedance")],
+            [InlineKeyboardButton(text="🤖 Grok", callback_data="engine:grok")],
+        ]
+    )
+
+
+def html_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def send_prompt_block(
+    chat_id: int, text: str, keyboard: InlineKeyboardMarkup | None = None
+) -> None:
+    """Send a prompt as a tap-to-copy code block instead of a file."""
+    chunks = split_text(text, 3500)
+    for index, chunk in enumerate(chunks):
+        is_last = index == len(chunks) - 1
+        await BOT.send_message(
+            chat_id,
+            f"<pre>{html_escape(chunk)}</pre>",
+            parse_mode="HTML",
+            reply_markup=keyboard if is_last else None,
+        )
 
 
 # user_id -> job_id: set when someone taps "✏️ Исправить промпт" and cleared once
 # their next plain-text message is consumed as the correction (see `fallback`).
 PENDING_PROMPT_REVISIONS: dict[int, str] = {}
+
+# user_id -> "photo" | "idea": which standalone mode the user selected from the
+# start menu, consumed by the next photo/text message they send.
+PENDING_MODE: dict[int, str] = {}
+
+# user_id -> "seedance" | "grok": which video engine to build the prompt for.
+VIDEO_ENGINE: dict[int, str] = {}
+
+# user_id -> latest prompt text, so the translate/revise buttons work for the
+# photo and idea modes too (those have no job record in the database).
+LAST_PROMPT: dict[int, str] = {}
 
 
 async def ensure_known(message: Message) -> bool:
@@ -1152,7 +1482,7 @@ async def command_start(message: Message) -> None:
             reply_markup=consent_keyboard(),
         )
         return
-    await message.answer("Пришлите видеофайл или публичную ссылку на видео. Проверить баланс: /balance")
+    await message.answer(WELCOME_TEXT, reply_markup=start_keyboard())
 
 
 @ROUTER.callback_query(F.data == "consent")
@@ -1161,7 +1491,73 @@ async def callback_consent(callback: CallbackQuery) -> None:
     await DB.consent(callback.from_user.id)
     await callback.answer("Разрешение сохранено")
     if callback.message:
-        await callback.message.edit_text("Готово. Теперь пришлите видеофайл или публичную ссылку.")
+        await callback.message.edit_text(WELCOME_TEXT)
+        await callback.message.answer("Выберите режим:", reply_markup=start_keyboard())
+
+
+@ROUTER.callback_query(F.data.startswith("mode:"))
+async def callback_mode(callback: CallbackQuery) -> None:
+    if not callback.data or not callback.message or not callback.from_user:
+        return
+    mode = callback.data.split(":", 1)[1]
+    await callback.answer()
+    if mode == "video":
+        await callback.message.answer(
+            "Для какой нейросети сделать промпт?", reply_markup=video_engine_keyboard()
+        )
+        return
+    PENDING_MODE[callback.from_user.id] = mode
+    if mode == "photo":
+        await callback.message.answer(
+            f"Пришлите фото — соберу промпт для генерации изображения.\n"
+            f"Стоимость: {S.tokens_per_photo} токенов."
+        )
+    else:
+        await callback.message.answer(
+            f"Опишите идею словами — соберу промпт с нуля.\n"
+            f"Стоимость: {S.tokens_per_photo} токенов."
+        )
+
+
+@ROUTER.callback_query(F.data.startswith("engine:"))
+async def callback_engine(callback: CallbackQuery) -> None:
+    if not callback.data or not callback.message or not callback.from_user:
+        return
+    engine = callback.data.split(":", 1)[1]
+    VIDEO_ENGINE[callback.from_user.id] = engine
+    PENDING_MODE.pop(callback.from_user.id, None)
+    await callback.answer()
+    name = "Seedance 2.0 / 2.5" if engine == "seedance" else "Grok"
+    await callback.message.answer(
+        f"Режим: {name}.\nПришлите видеофайл или публичную ссылку на видео."
+    )
+
+
+@ROUTER.callback_query(F.data.startswith("translate:"))
+async def callback_translate(callback: CallbackQuery) -> None:
+    if not callback.data or not callback.message or not callback.from_user:
+        return
+    key = callback.data.split(":", 1)[1]
+    prompt = LAST_PROMPT.get(callback.from_user.id)
+    if not prompt and key:
+        job = await DB.get_job(key, callback.from_user.id)
+        if job and job.get("scenario_path"):
+            path = Path(job["scenario_path"]).with_name("seedance-prompts.md")
+            if path.exists():
+                prompt = path.read_text(encoding="utf-8")
+    if not prompt:
+        await callback.answer("Промпт не найден", show_alert=True)
+        return
+    await callback.answer()
+    status = await callback.message.answer("Перевожу…")
+    try:
+        translated = await translate_prompt(prompt)
+        with suppress(Exception):
+            await status.delete()
+        # No buttons under the English version: it is the final copy-and-use step.
+        await send_prompt_block(callback.message.chat.id, translated)
+    except Exception as exc:
+        await status.edit_text("Не удалось перевести. Попробуйте ещё раз.\n" + str(exc)[-300:])
 
 
 @ROUTER.message(Command("balance"))
@@ -1370,13 +1766,10 @@ async def callback_seedance(callback: CallbackQuery) -> None:
         result = await create_seedance(scenario)
         path = Path(job["scenario_path"]).with_name("seedance-prompts.md")
         path.write_text(result, encoding="utf-8")
-        await status.edit_text("Готово.")
-        for chunk in chunks_with_intro("Промпт Seedance 2.0 (файл приложен):", result):
-            await callback.message.answer(chunk)
-        await callback.message.answer_document(
-            FSInputFile(path, filename=f"seedance-{job_id[:8]}.md"),
-            reply_markup=seedance_keyboard(job_id),
-        )
+        LAST_PROMPT[callback.from_user.id] = result
+        with suppress(Exception):
+            await status.delete()
+        await send_prompt_block(callback.message.chat.id, result, seedance_keyboard(job_id))
     except Exception as exc:
         await status.edit_text("Не удалось создать промпт. Попробуйте позже.\n" + str(exc)[-500:])
 
@@ -1482,21 +1875,19 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
             )
             scenario_path = job_dir / "scenario.md"
             scenario_path.write_text(scenario, encoding="utf-8")
-            await step("промпт Seedance", "5/5 — Создаю готовые промпты для Seedance 2.0…")
-            seedance = await asyncio.wait_for(create_seedance(scenario), timeout=600.0)
+            engine = VIDEO_ENGINE.get(user_id, "seedance")
+            engine_name = "Grok" if engine == "grok" else "Seedance 2.0 / 2.5"
+            await step("промпт видео", f"5/5 — Создаю промпт для {engine_name}…")
+            builder = create_grok if engine == "grok" else create_seedance
+            seedance = await asyncio.wait_for(builder(scenario), timeout=600.0)
             seedance_path = job_dir / "seedance-prompts.md"
             seedance_path.write_text(seedance, encoding="utf-8")
             await DB.complete(job_id, scenario_path)
-            await status("5/5 — Готово.")
-
-            for chunk in chunks_with_intro("Промпт Seedance 2.0 (файл приложен):", seedance):
-                await BOT.send_message(chat_id, chunk)
-            await BOT.send_document(
-                chat_id,
-                FSInputFile(seedance_path, filename=f"seedance-{job_id[:8]}.md"),
-                caption="Промпт Seedance 2.0.",
-                reply_markup=seedance_keyboard(job_id),
-            )
+            LAST_PROMPT[user_id] = seedance
+            with suppress(Exception):
+                await BOT.delete_message(chat_id, status_id)
+            # Prompt goes out as a tap-to-copy code block; no file is sent.
+            await send_prompt_block(chat_id, seedance, seedance_keyboard(job_id))
         except asyncio.TimeoutError:
             await DB.refund_job(job_id, "timeout")
             await status("Обработка не завершилась. Списанные токены возвращены автоматически.")
@@ -1594,40 +1985,135 @@ async def callback_revise_prompt(callback: CallbackQuery) -> None:
     await callback.message.answer("Напишите одним сообщением, что нужно исправить в промпте.")
 
 
+async def charge_small(user_id: int) -> bool:
+    """Charge the flat photo/idea prompt fee. Owner is never charged."""
+    if user_id == S.owner_id:
+        return True
+    return await DB.charge(user_id, S.tokens_per_photo, "photo_prompt")
+
+
+@ROUTER.message(F.photo)
+async def handle_photo(message: Message) -> None:
+    if not await ensure_known(message) or not message.from_user:
+        return
+    if PENDING_MODE.get(message.from_user.id) != "photo":
+        await message.answer(
+            "Чтобы сделать промпт по фото, сначала выберите режим 🖼 Промпт по фото в /start."
+        )
+        return
+    if not await charge_small(message.from_user.id):
+        balance = await DB.balance(message.from_user.id)
+        await message.answer(
+            f"Недостаточно токенов. Промпт по фото стоит {S.tokens_per_photo}, "
+            f"на балансе {balance}."
+        )
+        if S.payments_enabled:
+            await message.answer("Выберите пополнение:", reply_markup=buy_keyboard())
+        return
+    PENDING_MODE.pop(message.from_user.id, None)
+    status = await message.answer("Собираю промпт по фото…")
+    try:
+        photo = message.photo[-1]
+        file = await BOT.get_file(photo.file_id)
+        buffer = await BOT.download_file(file.file_path)
+        data_url = "data:image/jpeg;base64," + base64.b64encode(buffer.read()).decode("ascii")
+        described = await kie_request(
+            "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
+            visual_payload([
+                {"type": "text", "text": (
+                    "Подробно опиши это фото для последующего написания промпта: внешность и "
+                    "количество людей, длина и укладка волос (БЕЗ цвета), макияж, одежда, "
+                    "украшения, поза и действие, окружение, характер освещения, ракурс и "
+                    "крупность плана. Не называй цвет волос и цвет глаз."
+                )},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]),
+            attempts=3, timeout_seconds=180.0,
+        )
+        prompt = await create_photo_prompt(described)
+        LAST_PROMPT[message.from_user.id] = prompt
+        with suppress(Exception):
+            await status.delete()
+        await send_prompt_block(message.chat.id, prompt, seedance_keyboard("photo"))
+    except Exception as exc:
+        if message.from_user.id != S.owner_id:
+            await DB.grant(message.from_user.id, S.tokens_per_photo, "photo_refund")
+        await status.edit_text(
+            "Не удалось собрать промпт, токены возвращены.\n" + str(exc)[-400:]
+        )
+
+
 @ROUTER.message()
 async def fallback(message: Message) -> None:
     if not await ensure_known(message) or not message.from_user:
         return
-    job_id = PENDING_PROMPT_REVISIONS.pop(message.from_user.id, None)
+    user_id = message.from_user.id
+
+    job_id = PENDING_PROMPT_REVISIONS.pop(user_id, None)
     if job_id:
         correction = (message.text or "").strip()
         if not correction:
-            PENDING_PROMPT_REVISIONS[message.from_user.id] = job_id
+            PENDING_PROMPT_REVISIONS[user_id] = job_id
             await message.answer("Пришлите правку текстом одним сообщением.")
             return
-        job = await DB.get_job(job_id, message.from_user.id)
-        if not job or not job.get("scenario_path"):
+        prompt = LAST_PROMPT.get(user_id)
+        path = None
+        if job_id not in {"photo", "idea"}:
+            job = await DB.get_job(job_id, user_id)
+            if job and job.get("scenario_path"):
+                candidate = Path(job["scenario_path"]).with_name("seedance-prompts.md")
+                if candidate.exists():
+                    path = candidate
+                    prompt = candidate.read_text(encoding="utf-8")
+        if not prompt:
             await message.answer("Промпт не найден.")
-            return
-        path = Path(job["scenario_path"]).with_name("seedance-prompts.md")
-        if not path.exists():
-            await message.answer("Файл промпта не найден.")
             return
         status = await message.answer("Переписываю промпт с учётом правки…")
         try:
-            updated = await revise_seedance(path.read_text(encoding="utf-8"), correction)
-            path.write_text(updated, encoding="utf-8")
-            await status.edit_text("Готово.")
-            for chunk in chunks_with_intro("Исправленный промпт (файл приложен):", updated):
-                await message.answer(chunk)
-            await message.answer_document(
-                FSInputFile(path, filename=f"seedance-{job_id[:8]}.md"),
-                reply_markup=seedance_keyboard(job_id),
-            )
+            updated = await revise_seedance(prompt, correction)
+            LAST_PROMPT[user_id] = updated
+            if path:
+                path.write_text(updated, encoding="utf-8")
+            with suppress(Exception):
+                await status.delete()
+            await send_prompt_block(message.chat.id, updated, seedance_keyboard(job_id))
         except Exception as exc:
-            await status.edit_text("Не удалось применить правку. Попробуйте ещё раз.\n" + str(exc)[-500:])
+            await status.edit_text(
+                "Не удалось применить правку. Попробуйте ещё раз.\n" + str(exc)[-500:]
+            )
         return
-    await message.answer("Пришлите видеофайл или одну публичную ссылку на видео.")
+
+    if PENDING_MODE.get(user_id) == "idea":
+        idea = (message.text or "").strip()
+        if not idea:
+            await message.answer("Опишите идею текстом одним сообщением.")
+            return
+        if not await charge_small(user_id):
+            balance = await DB.balance(user_id)
+            await message.answer(
+                f"Недостаточно токенов. Промпт по описанию стоит {S.tokens_per_photo}, "
+                f"на балансе {balance}."
+            )
+            if S.payments_enabled:
+                await message.answer("Выберите пополнение:", reply_markup=buy_keyboard())
+            return
+        PENDING_MODE.pop(user_id, None)
+        status = await message.answer("Собираю промпт по описанию…")
+        try:
+            prompt = await create_idea_prompt(idea)
+            LAST_PROMPT[user_id] = prompt
+            with suppress(Exception):
+                await status.delete()
+            await send_prompt_block(message.chat.id, prompt, seedance_keyboard("idea"))
+        except Exception as exc:
+            if user_id != S.owner_id:
+                await DB.grant(user_id, S.tokens_per_photo, "idea_refund")
+            await status.edit_text(
+                "Не удалось собрать промпт, токены возвращены.\n" + str(exc)[-400:]
+            )
+        return
+
+    await message.answer("Выберите режим в /start или пришлите видео либо ссылку.")
 
 
 POLLING_TASK: asyncio.Task[Any] | None = None
@@ -1644,13 +2130,12 @@ async def lifespan(_: FastAPI):
         raise RuntimeError("TELEGRAM_BOT_TOKEN не настроен")
     await BOT.set_my_commands(
         [
-            BotCommand(command="start", description="🚀 Запустить бота"),
-            BotCommand(command="balance", description="💰 Баланс видеотокенов"),
+            BotCommand(command="start", description="ℹ️ Что умеет бот"),
+            BotCommand(command="balance", description="👤 Мой профиль"),
             BotCommand(command="buy", description="⭐ Пополнить баланс"),
-            BotCommand(command="privacy", description="Обработка и хранение видео"),
-            BotCommand(command="terms", description="Условия использования"),
-            BotCommand(command="support", description="Поддержка"),
-            BotCommand(command="paysupport", description="Вопросы по платежам"),
+            BotCommand(command="privacy", description="🔒 Обработка видео"),
+            BotCommand(command="terms", description="📄 Условия использования"),
+            BotCommand(command="support", description="💬 Поддержка"),
         ]
     )
     POLLING_TASK = asyncio.create_task(DP.start_polling(BOT, allowed_updates=DP.resolve_used_update_types()))
