@@ -62,6 +62,7 @@ class Settings:
     kie_visual_model: str = os.getenv("KIE_VISUAL_MODEL", "gemini-3-8-flash")
     kie_final_model: str = os.getenv("KIE_FINAL_MODEL", "gpt-5-6-terra")
     openai_text_model: str = os.getenv("OPENAI_TEXT_MODEL", "gpt-5.6-terra")
+    openai_vision_model: str = os.getenv("OPENAI_VISION_MODEL", "gpt-5.6-terra")
     moderation_model: str = os.getenv("MODERATION_MODEL", "omni-moderation-latest")
     moderation_enabled: bool = env_bool("MODERATION_ENABLED", True)
 
@@ -834,10 +835,7 @@ async def analyze_frame_batches(
             data_url = "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
             content.append({"type": "text", "text": f"Кадр, таймкод {timestamp:.3f} с:"})
             content.append({"type": "image_url", "image_url": {"url": data_url}})
-        report = await kie_request(
-            "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
-            visual_payload(content), attempts=3, timeout_seconds=300.0,
-        )
+        report = await analyze_images(content)
         if is_refusal(report):
             raise RuntimeError(
                 "Модель отказалась анализировать видео из-за политики безопасности "
@@ -887,58 +885,15 @@ def is_refusal(text: str) -> bool:
 async def analyze_video(
     url: str, cut_points: list[float], video: Path, target_dir: Path, duration: float
 ) -> tuple[str, list[str]]:
-    cut_hint = ", ".join(f"{value:.3f}" for value in cut_points)
-    content = [
-        {
-            "type": "text",
-            "text": VISUAL_PROMPT
-            + "\n\nЛокальный детектор кадров предложил следующие границы (секунды): "
-            + cut_hint
-            + ". Проверь каждую по самому видео, исправь ложные и добавь пропущенные.",
-        },
-        {"type": "image_url", "image_url": {"url": url}},
-    ]
-    try:
-        result = await kie_request(
-            "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
-            visual_payload(content), attempts=3, timeout_seconds=300.0,
-        )
-        lowered = result.lower()
-        error_markers = (
-            '"code": 524', '"code":524', "http 400", "interal error",
-        )
-        # Gemini sometimes answers with a normal HTTP 200 but plain text saying
-        # it couldn't actually see/reach the video (wrong content-type, slow
-        # Railway response, oversized file, etc). That text doesn't match the
-        # technical error markers above, so it used to be accepted as a valid
-        # (but empty) analysis. Catch those phrasings explicitly.
-        no_video_markers = (
-            "не вижу", "не видно", "не удалось получить доступ", "не могу получить доступ",
-            "не могу просмотреть", "не могу открыть", "не могу воспроизвести",
-            "не найдено видео", "видео не найдено", "нет прикреплённого видео",
-            "нет прикрепленного видео", "не был предоставлен", "не была предоставлена",
-            "отсутствует видео", "нет видео", "не содержит видео", "недоступн",
-            "cannot access", "can't access", "unable to access", "unable to view",
-            "unable to load", "i don't see", "i do not see", "i cannot see",
-            "no video", "no image or video", "video could not be", "failed to load",
-            "unable to retrieve", "unable to fetch", "i don't have access",
-            "i do not have access",
-        )
-        looks_empty = any(marker in lowered for marker in error_markers)
-        looks_blind = any(marker in lowered for marker in no_video_markers)
-        looks_refused = is_refusal(result)
-        # A genuine per-shot breakdown for a real video is long. A refusal or
-        # "I can't see it" reply is almost always short — use that as a second
-        # signal so phrasings not covered by the lists above are still caught.
-        looks_too_short = len(result.strip()) < 400
-        if looks_empty or looks_blind or looks_refused or looks_too_short:
-            raise RuntimeError(
-                "Прямой анализ видео по ссылке не удался (пустой/короткий/отрицающий/отказной ответ модели)"
-            )
-        return result, []
-    except RuntimeError:
-        frames = await extract_analysis_frames(video, target_dir / "analysis-frames", duration)
-        return await analyze_frame_batches(frames, cut_points)
+    """Analyze the video by extracting frames and sending them to OpenAI.
+
+    The previous approach handed Kie a public URL to the video file and hoped it
+    would fetch it. That was the single flakiest part of the pipeline: HTTP 404s
+    when the fetch hit a different process, 500/524 errors, and spurious policy
+    refusals. Frames sent inline are self-contained — nothing to fetch, nothing
+    to refuse on transport grounds."""
+    frames = await extract_analysis_frames(video, target_dir / "analysis-frames", duration)
+    return await analyze_frame_batches(frames, cut_points)
 
 
 SCENARIO_SYSTEM = """Ты создаёшь точную реконструкцию фактически проанализированного видео.
@@ -991,10 +946,36 @@ SCENARIO_SYSTEM = """Ты создаёшь точную реконструкци
 Пиши по-русски, подробно и профессионально. Верни полный сценарий целиком."""
 
 
+async def openai_vision(content: list[dict[str, Any]]) -> str:
+    """Image analysis via OpenAI. This is the primary path: the Kie endpoints
+    proved unreliable in practice (constant 500/524 errors and spurious policy
+    refusals), so Kie is only tried if this fails."""
+    if not OPENAI:
+        raise RuntimeError("OPENAI_API_KEY не настроен")
+    response = await OPENAI.chat.completions.create(
+        model=S.openai_vision_model,
+        messages=[{"role": "user", "content": content}],
+        max_completion_tokens=8000,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+async def analyze_images(content: list[dict[str, Any]]) -> str:
+    """Analyze images: OpenAI first, Kie only as a backup."""
+    try:
+        result = await openai_vision(content)
+        if result:
+            return result
+        raise RuntimeError("Пустой ответ OpenAI")
+    except Exception:
+        return await kie_request(
+            "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
+            visual_payload(content), attempts=2, timeout_seconds=180.0,
+        )
+
+
 async def openai_text(instruction: str, content: str) -> str:
-    """Text-only generation via OpenAI. Used as a fallback when the Kie
-    endpoints refuse or fail — OpenAI's policy filters are considerably less
-    trigger-happy on ordinary creative/scene description than Gemini's."""
+    """Text-only generation via OpenAI — the primary path for all text steps."""
     if not OPENAI:
         raise RuntimeError("OPENAI_API_KEY не настроен")
     response = await OPENAI.chat.completions.create(
@@ -1068,91 +1049,42 @@ async def generate_complete(
 
 
 async def terra_text(instruction: str, content: str, effort: str = "medium") -> str:
-    payload = {
-        "model": S.kie_final_model,
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": instruction + "\n\n" + content}],
-            }
-        ],
-        "reasoning": {"effort": effort},
-        "max_output_tokens": 22000,
+    """Generate text. OpenAI is the primary provider; the Kie endpoints are only
+    tried if OpenAI itself fails. Kie proved unreliable in production (repeated
+    500/524 errors and spurious policy refusals on ordinary content), so it is
+    no longer in the critical path."""
+    try:
+        result = await openai_text(instruction, content)
+        if result and not is_refusal(result):
+            return result
+    except Exception:
+        pass
+
+    # Backup: Kie Gemini endpoint.
+    fallback_payload = {
+        "messages": [{"role": "user", "content": instruction + "\n\n" + content}],
         "stream": False,
+        "include_thoughts": False,
+        "reasoning_effort": effort,
+        "max_tokens": 16000,
     }
     try:
-        # The Codex-compatible Kie endpoint can occasionally keep an SSE
-        # connection open indefinitely. Cap the whole request and then use the
-        # already configured Gemini endpoint as a text-only fallback.
-        result = await asyncio.wait_for(
-            kie_request(
-                "https://api.kie.ai/codex/v1/responses",
-                payload,
-                attempts=1,
-                timeout_seconds=240.0,
-            ),
-            timeout=300.0,
+        result = await kie_request(
+            "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
+            fallback_payload,
+            attempts=2,
+            timeout_seconds=240.0,
         )
-        if is_refusal(result):
-            raise RuntimeError("Codex endpoint refused the request")
-        return result
-    except (asyncio.TimeoutError, RuntimeError, httpx.HTTPError):
-        fallback_payload = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": instruction + "\n\n" + content,
-                }
-            ],
-            "stream": False,
-            "include_thoughts": False,
-            "reasoning_effort": effort,
-            # Without an explicit cap this endpoint used the provider default,
-            # which is far smaller than the primary path's budget — that was
-            # why prompts arrived cut off mid-sentence.
-            "max_tokens": 16000,
-        }
-        try:
-            result = await kie_request(
-                "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
-                fallback_payload,
-                attempts=2,
-                timeout_seconds=300.0,
-            )
-        except Exception:
-            # Both Kie endpoints are down/erroring (524, 500, timeouts). These
-            # steps are text-only, so fall back to OpenAI instead of failing.
-            return await openai_text(instruction, content)
-        if is_refusal(result):
-            # A short refusal-looking reply is sometimes a one-off fluke rather
-            # than a real, persistent policy block — retry once before giving
-            # up, so a transient hiccup doesn't abort the whole job.
-            await asyncio.sleep(2.0)
-            result = await kie_request(
-                "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
-                fallback_payload,
-                attempts=2,
-                timeout_seconds=300.0,
-            )
-        if is_refusal(result):
-            # Both Kie endpoints refused. These are text-only steps (scenario,
-            # prompt), so switch providers entirely rather than failing the job:
-            # OpenAI rarely blocks ordinary scene description that Gemini's
-            # stricter filters flag.
-            try:
-                openai_result = await openai_text(instruction, content)
-            except Exception as exc:
-                raise RuntimeError(
-                    "Оба сервиса отказались выполнить запрос. "
-                    f"Ошибка резервной модели: {str(exc)[-300:]}"
-                ) from exc
-            if is_refusal(openai_result) or not openai_result:
-                raise RuntimeError(
-                    "Запрос отклонён всеми доступными моделями. Попробуйте видео без "
-                    "спорных элементов или переформулируйте правку."
-                )
-            return openai_result
-        return result
+    except Exception as exc:
+        raise RuntimeError(
+            f"Сервисы генерации недоступны. {str(exc)[-300:]}"
+        ) from exc
+    if is_refusal(result) or not result:
+        raise RuntimeError(
+            "Запрос отклонён всеми доступными моделями. Попробуйте другое видео "
+            "или переформулируйте правку."
+        )
+    return result
 
 
 async def create_scenario(
@@ -1975,8 +1907,9 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
             )
             audio = await extract_audio(video, job_dir / "audio.mp3")
             cut_points = await detect_cuts(video, duration)
-            public_url, media_token = media_url(video)
-            media_tokens.append(media_token)
+            # No public URL is needed any more: frames are sent inline to
+            # OpenAI rather than fetched by a remote service.
+            public_url = ""
 
             async def get_transcript() -> str:
                 if audio is None:
@@ -2141,9 +2074,8 @@ async def handle_photo(message: Message) -> None:
         file = await BOT.get_file(photo.file_id)
         buffer = await BOT.download_file(file.file_path)
         data_url = "data:image/jpeg;base64," + base64.b64encode(buffer.read()).decode("ascii")
-        described = await kie_request(
-            "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
-            visual_payload([
+        described = await analyze_images(
+            [
                 {"type": "text", "text": (
                     "Подробно опиши это фото для последующего написания промпта: внешность и "
                     "количество людей, длина и укладка волос (БЕЗ цвета), макияж, одежда, "
@@ -2151,8 +2083,7 @@ async def handle_photo(message: Message) -> None:
                     "крупность плана. Не называй цвет волос и цвет глаз."
                 )},
                 {"type": "image_url", "image_url": {"url": data_url}},
-            ]),
-            attempts=2, timeout_seconds=120.0,
+            ]
         )
         prompt = await asyncio.wait_for(create_photo_prompt(described), timeout=300.0)
         LAST_PROMPT[message.from_user.id] = prompt
