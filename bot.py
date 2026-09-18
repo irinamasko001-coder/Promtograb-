@@ -211,7 +211,26 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at);
                 """
             )
+            # Remembered engine choice, so the user picks Seedance/Grok once and
+            # every later link uses it. Added via migration for existing tables.
+            with suppress(Exception):
+                await db.execute("ALTER TABLE users ADD COLUMN engine TEXT")
             await db.commit()
+
+    async def set_engine(self, user_id: int, engine: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET engine=?, updated_at=? WHERE user_id=?",
+                (engine, now_iso(), user_id),
+            )
+            await db.commit()
+
+    async def get_engine(self, user_id: int) -> str | None:
+        async with aiosqlite.connect(self.path) as db:
+            row = await (
+                await db.execute("SELECT engine FROM users WHERE user_id=?", (user_id,))
+            ).fetchone()
+            return row[0] if row and row[0] else None
 
     async def ensure_user(self, user_id: int, username: str | None, name: str) -> bool:
         async with aiosqlite.connect(self.path) as db:
@@ -422,7 +441,20 @@ async def run_command(*args: str) -> str:
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode:
-        raise RuntimeError(stderr.decode("utf-8", "replace")[-2000:])
+        text = stderr.decode("utf-8", "replace")
+        # ffmpeg prints a long version/metadata banner before the real error.
+        # Keep only the meaningful lines so the user sees the cause, not the banner.
+        noise = (
+            "ffmpeg version", "built with", "configuration:", "libav", "libsw", "libpost",
+            "Metadata:", "major_brand", "minor_version", "compatible_brands", "creation_time",
+            "handler_name", "vendor_id", "encoder", "Duration:", "Stream #", "Input #",
+            "Output #", "Stream mapping:", "Press [q]", "  ",
+        )
+        lines = [
+            line for line in text.splitlines()
+            if line.strip() and not any(line.startswith(n) or line.lstrip().startswith(n) for n in noise)
+        ]
+        raise RuntimeError(("\n".join(lines) or text)[-800:])
     return stdout.decode("utf-8", "replace")
 
 
@@ -437,7 +469,23 @@ async def video_info(path: Path) -> dict[str, Any]:
     return {"duration": duration, "width": stream.get("width"), "height": stream.get("height")}
 
 
-async def extract_audio(video: Path, audio: Path) -> Path:
+async def has_audio_stream(video: Path) -> bool:
+    """Many downloaded reels are video-only (muted clip, or the audio track was
+    never merged). Extracting audio from those makes ffmpeg fail outright, so
+    check first instead of crashing the whole job."""
+    try:
+        raw = await run_command(
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=codec_type", "-of", "json", str(video),
+        )
+        return bool(json.loads(raw).get("streams"))
+    except Exception:
+        return False
+
+
+async def extract_audio(video: Path, audio: Path) -> Path | None:
+    if not await has_audio_stream(video):
+        return None
     await run_command(
         "ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(audio)
     )
@@ -964,23 +1012,29 @@ TRUNCATION_MARK = "\u0000TRUNCATED"
 
 
 def looks_unfinished(text: str) -> bool:
-    """Heuristic: did generation stop mid-thought rather than complete?
-    A finished prompt always ends with the mandated final line (fps/format) or
-    at least closes its last sentence."""
+    """Did generation stop mid-thought rather than complete?
+
+    Only two signals count: the provider explicitly reported truncation, or the
+    last line is a long sentence cut off mid-way. Short field-style endings like
+    "План: средний план" are perfectly valid completions — treating those as
+    truncated (the earlier bug) triggered pointless extra generation rounds that
+    made every photo prompt several times slower and appended junk."""
     stripped = text.strip()
     if not stripped:
         return True
     if stripped.endswith(TRUNCATION_MARK):
         return True
     tail = stripped[-200:].lower()
-    if "fps" in tail or "24fps" in tail:
+    if "fps" in tail:
         return False
-    # Ends mid-word or mid-clause: no terminal punctuation at all.
-    return stripped[-1] not in ".!?»\"')"
+    last_line = stripped.splitlines()[-1].strip()
+    # A cut-off sentence is long and lacks closing punctuation. A finished field
+    # value is short, so it never qualifies.
+    return len(last_line) > 60 and last_line[-1] not in ".!?»\"')"
 
 
 async def generate_complete(
-    instruction: str, content: str, effort: str = "medium", max_rounds: int = 3
+    instruction: str, content: str, effort: str = "medium", max_rounds: int = 2
 ) -> str:
     """Run terra_text and, if the answer came back cut off, ask for the rest and
     stitch it on. Without this the user receives prompts that stop mid-sentence."""
@@ -1517,16 +1571,30 @@ async def command_start(message: Message) -> None:
         return
     created = await DB.ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     if not await DB.has_consent(message.from_user.id):
-        bonus = f" Вам начислено {S.starting_tokens} пробных токенов." if created and S.starting_tokens else ""
+        bonus = f"\n\nВам начислено {S.starting_tokens} пробных токенов." if created and S.starting_tokens else ""
+        # Show the real welcome text right away; consent is asked underneath it
+        # rather than replacing it.
         await message.answer(
-            "Бот принимает видеофайлы и публичные ссылки, распознаёт речь, анализирует планы, "
-            "жесты и эмоции и выдаёт готовые промпты для Seedance 2.0." + bonus +
-            "\n\nДля анализа файл временно передаётся внешним автоматизированным сервисам обработки. "
-            "Подтвердите, что у вас есть право использовать видео и вы разрешаете обработку.",
+            WELCOME_TEXT + bonus +
+            "\n\nДля анализа файл временно передаётся внешним автоматизированным сервисам "
+            "обработки. Подтвердите, что у вас есть право использовать видео и вы разрешаете "
+            "обработку.",
             reply_markup=consent_keyboard(),
         )
         return
     await message.answer(WELCOME_TEXT, reply_markup=start_keyboard())
+
+
+@ROUTER.message(Command("model"))
+async def command_model(message: Message) -> None:
+    if not await ensure_known(message) or not message.from_user:
+        return
+    current = VIDEO_ENGINE.get(message.from_user.id) or await DB.get_engine(message.from_user.id)
+    name = {"seedance": "Seedance 2.0 / 2.5", "grok": "Grok"}.get(current or "", "не выбрана")
+    await message.answer(
+        f"Текущая модель для видео: {name}.\nВыберите, какую использовать дальше:",
+        reply_markup=video_engine_keyboard(),
+    )
 
 
 @ROUTER.callback_query(F.data == "consent")
@@ -1569,6 +1637,7 @@ async def callback_engine(callback: CallbackQuery) -> None:
         return
     engine = callback.data.split(":", 1)[1]
     VIDEO_ENGINE[callback.from_user.id] = engine
+    await DB.set_engine(callback.from_user.id, engine)
     PENDING_MODE.pop(callback.from_user.id, None)
     await callback.answer()
     name = "Seedance 2.0 / 2.5" if engine == "seedance" else "Grok"
@@ -1903,7 +1972,13 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
             cut_points = await detect_cuts(video, duration)
             public_url, media_token = media_url(video)
             media_tokens.append(media_token)
-            transcript_task = asyncio.create_task(transcribe(audio))
+
+            async def get_transcript() -> str:
+                if audio is None:
+                    return "(в видео нет звуковой дорожки — речи нет)"
+                return await transcribe(audio)
+
+            transcript_task = asyncio.create_task(get_transcript())
             visual_task = asyncio.create_task(
                 analyze_video(public_url, cut_points, video, job_dir, duration)
             )
@@ -1919,7 +1994,7 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
             )
             scenario_path = job_dir / "scenario.md"
             scenario_path.write_text(scenario, encoding="utf-8")
-            engine = VIDEO_ENGINE.get(user_id, "seedance")
+            engine = VIDEO_ENGINE.get(user_id) or await DB.get_engine(user_id) or "seedance"
             engine_name = "Grok" if engine == "grok" else "Seedance 2.0 / 2.5"
             await step("промпт видео", f"5/5 — Создаю промпт для {engine_name}…")
             builder = create_grok if engine == "grok" else create_seedance
@@ -2072,13 +2147,19 @@ async def handle_photo(message: Message) -> None:
                 )},
                 {"type": "image_url", "image_url": {"url": data_url}},
             ]),
-            attempts=3, timeout_seconds=180.0,
+            attempts=2, timeout_seconds=120.0,
         )
-        prompt = await create_photo_prompt(described)
+        prompt = await asyncio.wait_for(create_photo_prompt(described), timeout=300.0)
         LAST_PROMPT[message.from_user.id] = prompt
         with suppress(Exception):
             await status.delete()
         await send_prompt_block(message.chat.id, prompt, seedance_keyboard("photo"))
+    except asyncio.TimeoutError:
+        if message.from_user.id != S.owner_id:
+            await DB.grant(message.from_user.id, S.tokens_per_photo, "photo_refund")
+        await status.edit_text(
+            "Сервис не ответил вовремя, токены возвращены. Попробуйте ещё раз."
+        )
     except Exception as exc:
         if message.from_user.id != S.owner_id:
             await DB.grant(message.from_user.id, S.tokens_per_photo, "photo_refund")
@@ -2144,11 +2225,17 @@ async def fallback(message: Message) -> None:
         PENDING_MODE.pop(user_id, None)
         status = await message.answer("Собираю промпт по описанию…")
         try:
-            prompt = await create_idea_prompt(idea)
+            prompt = await asyncio.wait_for(create_idea_prompt(idea), timeout=300.0)
             LAST_PROMPT[user_id] = prompt
             with suppress(Exception):
                 await status.delete()
             await send_prompt_block(message.chat.id, prompt, seedance_keyboard("idea"))
+        except asyncio.TimeoutError:
+            if user_id != S.owner_id:
+                await DB.grant(user_id, S.tokens_per_photo, "idea_refund")
+            await status.edit_text(
+                "Сервис не ответил вовремя, токены возвращены. Попробуйте ещё раз."
+            )
         except Exception as exc:
             if user_id != S.owner_id:
                 await DB.grant(user_id, S.tokens_per_photo, "idea_refund")
@@ -2177,6 +2264,7 @@ async def lifespan(_: FastAPI):
             BotCommand(command="start", description="ℹ️ Что умеет бот"),
             BotCommand(command="balance", description="👤 Мой профиль"),
             BotCommand(command="buy", description="⭐ Пополнить баланс"),
+            BotCommand(command="model", description="🎛 Сменить модель"),
             BotCommand(command="privacy", description="🔒 Обработка видео"),
             BotCommand(command="terms", description="📄 Условия использования"),
             BotCommand(command="support", description="💬 Поддержка"),
