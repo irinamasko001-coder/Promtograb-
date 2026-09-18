@@ -1404,18 +1404,26 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
 
     typing_task = asyncio.create_task(keep_typing())
 
+    # Track the last step we announced, so a failure or a hang reports where it
+    # actually got stuck instead of a bare error with no context.
+    current_step = {"name": "старт"}
+
+    async def step(name: str, text: str) -> None:
+        current_step["name"] = name
+        await status(text)
+
     async with WORK_SEMAPHORE:
         try:
             video = local_path
             if video is None:
-                await status("1/5 — Загружаю видео по ссылке…")
+                await step("загрузка по ссылке", "1/5 — Загружаю видео по ссылке…")
                 video = await download_url(source, job_dir)
             if not video.exists() or not video.stat().st_size:
                 raise RuntimeError("Видео не загрузилось")
             if video.stat().st_size > S.max_upload_bytes:
                 raise RuntimeError(f"Файл больше лимита {S.max_upload_mb} МБ")
 
-            await status("2/5 — Проверяю длительность и баланс…")
+            await step("проверка длительности", "2/5 — Проверяю длительность и баланс…")
             meta = await video_info(video)
             duration = float(meta["duration"])
             if duration <= 0:
@@ -1424,7 +1432,7 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
                 raise RuntimeError(f"Максимальная длительность сейчас {S.max_video_seconds // 60} минут")
 
             if S.moderation_enabled:
-                await status("2/5 — Проверяю содержание видео…")
+                await step("модерация", "2/5 — Проверяю содержание видео…")
                 try:
                     mod_frames = await moderation_frames(video, duration, job_dir / "moderation-frames")
                 except Exception:
@@ -1448,7 +1456,12 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
                     await BOT.send_message(chat_id, "Выберите пополнение:", reply_markup=buy_keyboard())
                 return
 
-            await status(f"3/5 — Распознаю речь и анализирую видео… Списано {cost} токенов.")
+            remaining = await DB.balance(user_id)
+            await step(
+                "расшифровка речи и анализ видео",
+                f"3/5 — Распознаю речь и анализирую видео… "
+                f"Списано {cost} токенов, осталось {remaining}.",
+            )
             audio = await extract_audio(video, job_dir / "audio.mp3")
             cut_points = await detect_cuts(video, duration)
             public_url, media_token = media_url(video)
@@ -1457,16 +1470,20 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
             visual_task = asyncio.create_task(
                 analyze_video(public_url, cut_points, video, job_dir, duration)
             )
-            transcript, visual_result = await asyncio.gather(transcript_task, visual_task)
+            transcript, visual_result = await asyncio.wait_for(
+                asyncio.gather(transcript_task, visual_task), timeout=900.0
+            )
             visual, fallback_tokens = visual_result
             media_tokens.extend(fallback_tokens)
 
-            await status("4/5 — Собираю планы, реплики, жесты и эмоции по секундам…")
-            scenario = await create_scenario(meta, transcript, visual)
+            await step("сценарий", "4/5 — Собираю планы, реплики, жесты и эмоции по секундам…")
+            scenario = await asyncio.wait_for(
+                create_scenario(meta, transcript, visual), timeout=600.0
+            )
             scenario_path = job_dir / "scenario.md"
             scenario_path.write_text(scenario, encoding="utf-8")
-            await status("5/5 — Создаю готовые промпты для Seedance 2.0…")
-            seedance = await create_seedance(scenario)
+            await step("промпт Seedance", "5/5 — Создаю готовые промпты для Seedance 2.0…")
+            seedance = await asyncio.wait_for(create_seedance(scenario), timeout=600.0)
             seedance_path = job_dir / "seedance-prompts.md"
             seedance_path.write_text(seedance, encoding="utf-8")
             await DB.complete(job_id, scenario_path)
@@ -1480,13 +1497,21 @@ async def process_job(job_id: str, user_id: int, chat_id: int, source: str, loca
                 caption="Промпт Seedance 2.0.",
                 reply_markup=seedance_keyboard(job_id),
             )
-        except Exception as exc:
-            if charged:
-                await DB.refund_job(job_id, str(exc))
-            else:
-                await DB.refund_job(job_id, str(exc))
+        except asyncio.TimeoutError:
+            await DB.refund_job(job_id, "timeout")
             await status("Обработка не завершилась. Списанные токены возвращены автоматически.")
-            await BOT.send_message(chat_id, "Причина: " + str(exc)[-1200:])
+            await BOT.send_message(
+                chat_id,
+                f"Причина: превышено время ожидания на шаге «{current_step['name']}». "
+                "Обычно это перегрузка сервиса анализа — попробуйте ещё раз через пару минут.",
+            )
+        except Exception as exc:
+            await DB.refund_job(job_id, str(exc))
+            await status("Обработка не завершилась. Списанные токены возвращены автоматически.")
+            await BOT.send_message(
+                chat_id,
+                f"Причина (шаг «{current_step['name']}»): " + str(exc)[-1200:],
+            )
         finally:
             typing_task.cancel()
             with suppress(Exception):
