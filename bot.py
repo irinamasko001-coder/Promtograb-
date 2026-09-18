@@ -85,9 +85,9 @@ class Settings:
     @property
     def packages(self) -> dict[int, int]:
         return {
-            600: int(os.getenv("PACKAGE_600_STARS", "300")),
-            1800: int(os.getenv("PACKAGE_1800_STARS", "700")),
-            6000: int(os.getenv("PACKAGE_6000_STARS", "1900")),
+            300: int(os.getenv("PACKAGE_300_STARS", "150")),
+            600: int(os.getenv("PACKAGE_600_STARS", "250")),
+            1200: int(os.getenv("PACKAGE_1200_STARS", "500")),
         }
 
     def validate(self) -> None:
@@ -745,10 +745,9 @@ async def analyze_frame_batches(
                 ),
             }]
             for timestamp, path in batch:
-                url, token = media_url(path)
-                tokens.append(token)
+                data_url = "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
                 content.append({"type": "text", "text": f"Кадр, таймкод {timestamp:.3f} с:"})
-                content.append({"type": "image_url", "image_url": {"url": url}})
+                content.append({"type": "image_url", "image_url": {"url": data_url}})
             report = await kie_request(
                 "https://api.kie.ai/gemini-3-8-flash-openai/v1/chat/completions",
                 visual_payload(content), attempts=3, timeout_seconds=300.0,
